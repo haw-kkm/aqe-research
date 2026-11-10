@@ -1,0 +1,169 @@
+{
+  "$defs": {
+    "FeatureProfile": {
+      "enum": [
+        "ohlcv_v0",
+        "flow_v1"
+      ],
+      "title": "FeatureProfile",
+      "type": "string"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "Provenance": {
+      "enum": [
+        "LIVE_CAPTURE",
+        "VERIFIED_ARCHIVE",
+        "ASSUMED_LATENCY_REPLAY",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "QualityStatus": {
+      "enum": [
+        "OK",
+        "DEGRADED",
+        "INVALID",
+        "MISSING"
+      ],
+      "title": "QualityStatus",
+      "type": "string"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "instrument": {
+      "$ref": "#/$defs/InstrumentKey"
+    },
+    "as_of": {
+      "format": "date-time",
+      "title": "As Of",
+      "type": "string"
+    },
+    "feature_profile": {
+      "$ref": "#/$defs/FeatureProfile"
+    },
+    "schema_version": {
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "feature_names": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Feature Names",
+      "type": "array"
+    },
+    "values": {
+      "items": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Values",
+      "type": "array"
+    },
+    "missing_mask": {
+      "items": {
+        "type": "boolean"
+      },
+      "title": "Missing Mask",
+      "type": "array"
+    },
+    "source_watermarks": {
+      "additionalProperties": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "title": "Source Watermarks",
+      "type": "object"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "quality": {
+      "$ref": "#/$defs/QualityStatus"
+    },
+    "quality_reasons": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Quality Reasons",
+      "type": "array"
+    },
+    "feature_schema_hash": {
+      "title": "Feature Schema Hash",
+      "type": "string"
+    },
+    "manifest_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Manifest Hash"
+    }
+  },
+  "required": [
+    "instrument",
+    "as_of",
+    "feature_profile",
+    "feature_names",
+    "values",
+    "missing_mask",
+    "source_watermarks",
+    "provenance",
+    "quality",
+    "feature_schema_hash"
+  ],
+  "title": "FeatureSnapshot",
+  "type": "object"
+}

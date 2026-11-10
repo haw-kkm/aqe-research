@@ -1,0 +1,158 @@
+{
+  "$defs": {
+    "Disposition": {
+      "enum": [
+        "REVIEW_CANDIDATE",
+        "RESEARCH_ONLY",
+        "ABSTAIN"
+      ],
+      "title": "Disposition",
+      "type": "string"
+    },
+    "RuleOutcome": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "UNKNOWN"
+      ],
+      "title": "RuleOutcome",
+      "type": "string"
+    },
+    "RuleResult": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "order": {
+          "title": "Order",
+          "type": "integer"
+        },
+        "outcome": {
+          "$ref": "#/$defs/RuleOutcome"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "recovery_condition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recovery Condition"
+        },
+        "caps_disposition_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Caps Disposition At"
+        }
+      },
+      "required": [
+        "rule_id",
+        "order",
+        "outcome",
+        "reason"
+      ],
+      "title": "RuleResult",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "analysis_id": {
+      "title": "Analysis Id",
+      "type": "string"
+    },
+    "horizon_seconds": {
+      "title": "Horizon Seconds",
+      "type": "integer"
+    },
+    "ruleset_id": {
+      "title": "Ruleset Id",
+      "type": "string"
+    },
+    "ruleset_hash": {
+      "title": "Ruleset Hash",
+      "type": "string"
+    },
+    "rules": {
+      "items": {
+        "$ref": "#/$defs/RuleResult"
+      },
+      "title": "Rules",
+      "type": "array"
+    },
+    "risk_outcome": {
+      "$ref": "#/$defs/RuleOutcome"
+    },
+    "disposition": {
+      "$ref": "#/$defs/Disposition"
+    },
+    "reasons": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Reasons",
+      "type": "array"
+    },
+    "portfolio_status": {
+      "enum": [
+        "PROVIDED",
+        "UNKNOWN"
+      ],
+      "title": "Portfolio Status",
+      "type": "string"
+    },
+    "approval_required": {
+      "const": true,
+      "default": true,
+      "title": "Approval Required",
+      "type": "boolean"
+    },
+    "execution_enabled": {
+      "const": false,
+      "default": false,
+      "title": "Execution Enabled",
+      "type": "boolean"
+    },
+    "decided_at": {
+      "format": "date-time",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "valid_until": {
+      "format": "date-time",
+      "title": "Valid Until",
+      "type": "string"
+    }
+  },
+  "required": [
+    "analysis_id",
+    "horizon_seconds",
+    "ruleset_id",
+    "ruleset_hash",
+    "rules",
+    "risk_outcome",
+    "disposition",
+    "reasons",
+    "portfolio_status",
+    "decided_at",
+    "valid_until"
+  ],
+  "title": "RiskDecision",
+  "type": "object"
+}

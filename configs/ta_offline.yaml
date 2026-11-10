@@ -1,0 +1,24 @@
+# M4 offline contract run of the REAL TradingAgents graph (pinned SHA) with an offline scripted
+# chat model (no network, no API key). Proves wiring/isolation only; NOT an LLM-quality result.
+schema_version: "1.0.0"
+mode: replay
+paths:
+  data_root: "E:/aqe-v2/data"
+  artifact_root: "E:/aqe-v2/artifacts"
+instruments:
+  - {venue: binance, market_type: usdm_perpetual, instrument_id: BTCUSDT}
+backfill:
+  start: "2019-09-08T00:00:00Z"
+context:
+  backend: tradingagents
+  job_timeout_seconds: 300
+  llm:
+    provider: offline_scripted
+    model_id: aqe-offline-scripted
+  tradingagents:
+    upstream_sha: "9fa1196fffbcfd9de5146d2dd2869df84ab99838"
+    worker_python: ".venv-ta/Scripts/python.exe"
+    selected_analysts: ["market", "news"]
+risk_ruleset: configs/risk_rules_v1.yaml
+analysis:
+  experiment_config: configs/experiment.yaml

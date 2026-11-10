@@ -1,0 +1,82 @@
+{
+  "$defs": {
+    "Position": {
+      "additionalProperties": false,
+      "properties": {
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        },
+        "market_type": {
+          "title": "Market Type",
+          "type": "string"
+        },
+        "quantity_base": {
+          "title": "Quantity Base",
+          "type": "number"
+        },
+        "entry_price_quote": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entry Price Quote"
+        }
+      },
+      "required": [
+        "instrument_id",
+        "market_type",
+        "quantity_base"
+      ],
+      "title": "Position",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A user-supplied account snapshot. Absence of a snapshot means UNKNOWN, never flat (T11).",
+  "properties": {
+    "snapshot_id": {
+      "title": "Snapshot Id",
+      "type": "string"
+    },
+    "as_of": {
+      "format": "date-time",
+      "title": "As Of",
+      "type": "string"
+    },
+    "equity_quote": {
+      "title": "Equity Quote",
+      "type": "number"
+    },
+    "positions": {
+      "items": {
+        "$ref": "#/$defs/Position"
+      },
+      "title": "Positions",
+      "type": "array"
+    },
+    "daily_loss_quote": {
+      "default": 0.0,
+      "title": "Daily Loss Quote",
+      "type": "number"
+    },
+    "source": {
+      "default": "user_supplied",
+      "title": "Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "snapshot_id",
+    "as_of",
+    "equity_quote",
+    "positions"
+  ],
+  "title": "PortfolioSnapshot",
+  "type": "object"
+}

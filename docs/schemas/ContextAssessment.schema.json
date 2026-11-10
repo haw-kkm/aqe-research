@@ -1,0 +1,482 @@
+{
+  "$defs": {
+    "Claim": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClaimKind"
+        },
+        "direction": {
+          "$ref": "#/$defs/ClaimDirection"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "falsifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Falsifier"
+        }
+      },
+      "required": [
+        "text",
+        "kind",
+        "direction",
+        "evidence_ids"
+      ],
+      "title": "Claim",
+      "type": "object"
+    },
+    "ClaimDirection": {
+      "enum": [
+        "UP",
+        "DOWN",
+        "NONE"
+      ],
+      "title": "ClaimDirection",
+      "type": "string"
+    },
+    "ClaimKind": {
+      "enum": [
+        "OBSERVATION",
+        "INFERENCE"
+      ],
+      "title": "ClaimKind",
+      "type": "string"
+    },
+    "ContextStatus": {
+      "enum": [
+        "OK",
+        "PARTIAL",
+        "MISSING",
+        "TIMEOUT",
+        "INVALID",
+        "UNSUPPORTED"
+      ],
+      "title": "ContextStatus",
+      "type": "string"
+    },
+    "ContextUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "llm_calls": {
+          "default": 0,
+          "title": "Llm Calls",
+          "type": "integer"
+        },
+        "prompt_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Tokens"
+        },
+        "completion_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completion Tokens"
+        },
+        "cost_estimate_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost Estimate Usd"
+        },
+        "cost_basis": {
+          "default": "unknown",
+          "title": "Cost Basis",
+          "type": "string"
+        },
+        "latency_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latency Seconds"
+        }
+      },
+      "title": "ContextUsage",
+      "type": "object"
+    },
+    "EventFlag": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "window_start": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window Start"
+        },
+        "window_end": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window End"
+        }
+      },
+      "required": [
+        "name",
+        "severity",
+        "evidence_ids"
+      ],
+      "title": "EventFlag",
+      "type": "object"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "TemporalScope": {
+      "enum": [
+        "INTRADAY_ASOF_VERIFIED",
+        "DAILY_CONTEXT_ONLY",
+        "UNVERIFIED"
+      ],
+      "title": "TemporalScope",
+      "type": "string"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "assessment_id": {
+      "title": "Assessment Id",
+      "type": "string"
+    },
+    "instrument": {
+      "$ref": "#/$defs/InstrumentKey"
+    },
+    "as_of": {
+      "format": "date-time",
+      "title": "As Of",
+      "type": "string"
+    },
+    "backend": {
+      "title": "Backend",
+      "type": "string"
+    },
+    "upstream_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Upstream Ref"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider"
+    },
+    "model_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Id"
+    },
+    "response_model": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Response Model"
+    },
+    "temperature": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Temperature"
+    },
+    "prompt_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Prompt Hash"
+    },
+    "config_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Config Hash"
+    },
+    "bundle_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Bundle Id"
+    },
+    "bundle_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Bundle Hash"
+    },
+    "cache_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cache Key"
+    },
+    "evidence_ids_used": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Ids Used",
+      "type": "array"
+    },
+    "claims": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Claim"
+      },
+      "title": "Claims",
+      "type": "array"
+    },
+    "counterclaims": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Claim"
+      },
+      "title": "Counterclaims",
+      "type": "array"
+    },
+    "event_flags": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/EventFlag"
+      },
+      "title": "Event Flags",
+      "type": "array"
+    },
+    "coverage": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Coverage",
+      "type": "object"
+    },
+    "temporal_scope": {
+      "$ref": "#/$defs/TemporalScope"
+    },
+    "contextual_rating": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Contextual Rating"
+    },
+    "review_required": {
+      "default": false,
+      "title": "Review Required",
+      "type": "boolean"
+    },
+    "status": {
+      "$ref": "#/$defs/ContextStatus"
+    },
+    "status_reasons": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Status Reasons",
+      "type": "array"
+    },
+    "usage": {
+      "$ref": "#/$defs/ContextUsage",
+      "default": {
+        "llm_calls": 0,
+        "prompt_tokens": null,
+        "completion_tokens": null,
+        "cost_estimate_usd": null,
+        "cost_basis": "unknown",
+        "latency_seconds": null
+      }
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "valid_until": {
+      "format": "date-time",
+      "title": "Valid Until",
+      "type": "string"
+    }
+  },
+  "required": [
+    "assessment_id",
+    "instrument",
+    "as_of",
+    "backend",
+    "temporal_scope",
+    "status",
+    "generated_at",
+    "valid_until"
+  ],
+  "title": "ContextAssessment",
+  "type": "object"
+}

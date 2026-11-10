@@ -1,0 +1,303 @@
+{
+  "$defs": {
+    "FeatureProfile": {
+      "enum": [
+        "ohlcv_v0",
+        "flow_v1"
+      ],
+      "title": "FeatureProfile",
+      "type": "string"
+    },
+    "FoldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "fold_id": {
+          "title": "Fold Id",
+          "type": "string"
+        },
+        "train_start": {
+          "format": "date-time",
+          "title": "Train Start",
+          "type": "string"
+        },
+        "train_label_end_max": {
+          "format": "date-time",
+          "title": "Train Label End Max",
+          "type": "string"
+        },
+        "oos_start": {
+          "format": "date-time",
+          "title": "Oos Start",
+          "type": "string"
+        },
+        "oos_end": {
+          "format": "date-time",
+          "title": "Oos End",
+          "type": "string"
+        },
+        "embargo_seconds": {
+          "title": "Embargo Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fold_id",
+        "train_start",
+        "train_label_end_max",
+        "oos_start",
+        "oos_end",
+        "embargo_seconds"
+      ],
+      "title": "FoldSpec",
+      "type": "object"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "Provenance": {
+      "enum": [
+        "LIVE_CAPTURE",
+        "VERIFIED_ARCHIVE",
+        "ASSUMED_LATENCY_REPLAY",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "SegmentSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "start": {
+          "format": "date-time",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "format": "date-time",
+          "title": "End",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "start",
+        "end"
+      ],
+      "title": "SegmentSpec",
+      "type": "object"
+    },
+    "SourceFileRef": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "rows": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rows"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "SourceFileRef",
+      "type": "object"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "dataset_id": {
+      "title": "Dataset Id",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "schema_version": {
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "instrument": {
+      "$ref": "#/$defs/InstrumentKey"
+    },
+    "feature_profile": {
+      "$ref": "#/$defs/FeatureProfile"
+    },
+    "bar_interval_seconds": {
+      "title": "Bar Interval Seconds",
+      "type": "integer"
+    },
+    "decision_delay_seconds": {
+      "title": "Decision Delay Seconds",
+      "type": "integer"
+    },
+    "feature_names": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Feature Names",
+      "type": "array"
+    },
+    "feature_schema_hash": {
+      "title": "Feature Schema Hash",
+      "type": "string"
+    },
+    "horizons_seconds": {
+      "items": {
+        "type": "integer"
+      },
+      "title": "Horizons Seconds",
+      "type": "array"
+    },
+    "label_definition": {
+      "additionalProperties": true,
+      "title": "Label Definition",
+      "type": "object"
+    },
+    "data_start": {
+      "format": "date-time",
+      "title": "Data Start",
+      "type": "string"
+    },
+    "data_end": {
+      "format": "date-time",
+      "title": "Data End",
+      "type": "string"
+    },
+    "provenance": {
+      "items": {
+        "$ref": "#/$defs/Provenance"
+      },
+      "title": "Provenance",
+      "type": "array"
+    },
+    "segments": {
+      "items": {
+        "$ref": "#/$defs/SegmentSpec"
+      },
+      "title": "Segments",
+      "type": "array"
+    },
+    "folds": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/FoldSpec"
+        },
+        "type": "array"
+      },
+      "title": "Folds",
+      "type": "object"
+    },
+    "purge_rules": {
+      "additionalProperties": true,
+      "title": "Purge Rules",
+      "type": "object"
+    },
+    "source_files": {
+      "items": {
+        "$ref": "#/$defs/SourceFileRef"
+      },
+      "title": "Source Files",
+      "type": "array"
+    },
+    "n_rows": {
+      "title": "N Rows",
+      "type": "integer"
+    },
+    "config_hash": {
+      "title": "Config Hash",
+      "type": "string"
+    },
+    "code_version": {
+      "title": "Code Version",
+      "type": "string"
+    },
+    "notes": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Notes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "dataset_id",
+    "created_at",
+    "instrument",
+    "feature_profile",
+    "bar_interval_seconds",
+    "decision_delay_seconds",
+    "feature_names",
+    "feature_schema_hash",
+    "horizons_seconds",
+    "label_definition",
+    "data_start",
+    "data_end",
+    "provenance",
+    "segments",
+    "purge_rules",
+    "source_files",
+    "n_rows",
+    "config_hash",
+    "code_version"
+  ],
+  "title": "DatasetManifest",
+  "type": "object"
+}

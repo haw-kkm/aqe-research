@@ -1,0 +1,253 @@
+{
+  "$defs": {
+    "ClassProbabilities": {
+      "additionalProperties": false,
+      "description": "Probabilities in fixed class order [down, neutral, up].",
+      "properties": {
+        "p_down": {
+          "title": "P Down",
+          "type": "number"
+        },
+        "p_neutral": {
+          "title": "P Neutral",
+          "type": "number"
+        },
+        "p_up": {
+          "title": "P Up",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p_down",
+        "p_neutral",
+        "p_up"
+      ],
+      "title": "ClassProbabilities",
+      "type": "object"
+    },
+    "FeatureProfile": {
+      "enum": [
+        "ohlcv_v0",
+        "flow_v1"
+      ],
+      "title": "FeatureProfile",
+      "type": "string"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "ModelReadiness": {
+      "enum": [
+        "IMPLEMENTED_UNTRAINED",
+        "TRAINED_UNVALIDATED",
+        "OOS_EVALUATED",
+        "FORWARD_EVALUATED"
+      ],
+      "title": "ModelReadiness",
+      "type": "string"
+    },
+    "PredictionKey": {
+      "additionalProperties": false,
+      "description": "Join key for predictions (B04): venue, market_type, instrument_id, as_of,\nhorizon_seconds, feature_profile, schema_version.",
+      "properties": {
+        "instrument": {
+          "$ref": "#/$defs/InstrumentKey"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "horizon_seconds": {
+          "title": "Horizon Seconds",
+          "type": "integer"
+        },
+        "feature_profile": {
+          "$ref": "#/$defs/FeatureProfile"
+        },
+        "schema_version": {
+          "default": "1.0.0",
+          "title": "Schema Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument",
+        "as_of",
+        "horizon_seconds",
+        "feature_profile"
+      ],
+      "title": "PredictionKey",
+      "type": "object"
+    },
+    "PredictionStatus": {
+      "enum": [
+        "OK",
+        "INVALID",
+        "STALE",
+        "UNAVAILABLE"
+      ],
+      "title": "PredictionStatus",
+      "type": "string"
+    },
+    "ReadyAtBasis": {
+      "enum": [
+        "WALL_CLOCK",
+        "ASSUMED_LATENCY"
+      ],
+      "title": "ReadyAtBasis",
+      "type": "string"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "prediction_id": {
+      "title": "Prediction Id",
+      "type": "string"
+    },
+    "key": {
+      "$ref": "#/$defs/PredictionKey"
+    },
+    "model_kind": {
+      "title": "Model Kind",
+      "type": "string"
+    },
+    "artifact_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Artifact Id"
+    },
+    "train_label_cutoff": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Train Label Cutoff"
+    },
+    "probabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClassProbabilities"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expected_return": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Expected Return"
+    },
+    "expected_return_status": {
+      "default": "unknown",
+      "title": "Expected Return Status",
+      "type": "string"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "ready_at": {
+      "format": "date-time",
+      "title": "Ready At",
+      "type": "string"
+    },
+    "ready_at_basis": {
+      "$ref": "#/$defs/ReadyAtBasis"
+    },
+    "valid_until": {
+      "format": "date-time",
+      "title": "Valid Until",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/PredictionStatus"
+    },
+    "readiness": {
+      "$ref": "#/$defs/ModelReadiness"
+    },
+    "status_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status Reason"
+    }
+  },
+  "required": [
+    "prediction_id",
+    "key",
+    "model_kind",
+    "artifact_id",
+    "train_label_cutoff",
+    "probabilities",
+    "generated_at",
+    "ready_at",
+    "ready_at_basis",
+    "valid_until",
+    "status",
+    "readiness"
+  ],
+  "title": "ModelPrediction",
+  "type": "object"
+}

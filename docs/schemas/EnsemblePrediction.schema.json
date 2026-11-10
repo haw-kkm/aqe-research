@@ -1,0 +1,289 @@
+{
+  "$defs": {
+    "ClassProbabilities": {
+      "additionalProperties": false,
+      "description": "Probabilities in fixed class order [down, neutral, up].",
+      "properties": {
+        "p_down": {
+          "title": "P Down",
+          "type": "number"
+        },
+        "p_neutral": {
+          "title": "P Neutral",
+          "type": "number"
+        },
+        "p_up": {
+          "title": "P Up",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p_down",
+        "p_neutral",
+        "p_up"
+      ],
+      "title": "ClassProbabilities",
+      "type": "object"
+    },
+    "EnsembleStatus": {
+      "enum": [
+        "OK",
+        "ABSTAIN"
+      ],
+      "title": "EnsembleStatus",
+      "type": "string"
+    },
+    "FeatureProfile": {
+      "enum": [
+        "ohlcv_v0",
+        "flow_v1"
+      ],
+      "title": "FeatureProfile",
+      "type": "string"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "ModelReadiness": {
+      "enum": [
+        "IMPLEMENTED_UNTRAINED",
+        "TRAINED_UNVALIDATED",
+        "OOS_EVALUATED",
+        "FORWARD_EVALUATED"
+      ],
+      "title": "ModelReadiness",
+      "type": "string"
+    },
+    "OODStatus": {
+      "enum": [
+        "IN_DISTRIBUTION",
+        "OUT_OF_DISTRIBUTION",
+        "UNKNOWN"
+      ],
+      "title": "OODStatus",
+      "type": "string"
+    },
+    "PredictionKey": {
+      "additionalProperties": false,
+      "description": "Join key for predictions (B04): venue, market_type, instrument_id, as_of,\nhorizon_seconds, feature_profile, schema_version.",
+      "properties": {
+        "instrument": {
+          "$ref": "#/$defs/InstrumentKey"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "horizon_seconds": {
+          "title": "Horizon Seconds",
+          "type": "integer"
+        },
+        "feature_profile": {
+          "$ref": "#/$defs/FeatureProfile"
+        },
+        "schema_version": {
+          "default": "1.0.0",
+          "title": "Schema Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument",
+        "as_of",
+        "horizon_seconds",
+        "feature_profile"
+      ],
+      "title": "PredictionKey",
+      "type": "object"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "ensemble_id": {
+      "title": "Ensemble Id",
+      "type": "string"
+    },
+    "key": {
+      "$ref": "#/$defs/PredictionKey"
+    },
+    "combo": {
+      "title": "Combo",
+      "type": "string"
+    },
+    "base_prediction_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Base Prediction Ids",
+      "type": "array"
+    },
+    "context_assessment_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Context Assessment Id"
+    },
+    "meta_artifact_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Meta Artifact Id"
+    },
+    "calibrator_artifact_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Calibrator Artifact Id"
+    },
+    "probabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClassProbabilities"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "disagreement": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Disagreement",
+      "type": "object"
+    },
+    "disagreement_threshold": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Disagreement Threshold"
+    },
+    "ood_status": {
+      "$ref": "#/$defs/OODStatus"
+    },
+    "missingness": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Missingness",
+      "type": "object"
+    },
+    "status": {
+      "$ref": "#/$defs/EnsembleStatus"
+    },
+    "abstain_reasons": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Abstain Reasons",
+      "type": "array"
+    },
+    "readiness": {
+      "$ref": "#/$defs/ModelReadiness"
+    },
+    "calibration_validated": {
+      "title": "Calibration Validated",
+      "type": "boolean"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "ready_at": {
+      "format": "date-time",
+      "title": "Ready At",
+      "type": "string"
+    },
+    "valid_until": {
+      "format": "date-time",
+      "title": "Valid Until",
+      "type": "string"
+    },
+    "extra": {
+      "additionalProperties": true,
+      "default": {},
+      "title": "Extra",
+      "type": "object"
+    }
+  },
+  "required": [
+    "ensemble_id",
+    "key",
+    "combo",
+    "base_prediction_ids",
+    "context_assessment_id",
+    "meta_artifact_id",
+    "calibrator_artifact_id",
+    "probabilities",
+    "disagreement",
+    "disagreement_threshold",
+    "ood_status",
+    "missingness",
+    "status",
+    "readiness",
+    "calibration_validated",
+    "generated_at",
+    "ready_at",
+    "valid_until"
+  ],
+  "title": "EnsemblePrediction",
+  "type": "object"
+}

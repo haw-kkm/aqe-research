@@ -1,0 +1,155 @@
+{
+  "$defs": {
+    "SourceKind": {
+      "enum": [
+        "MARKET_FLOW",
+        "NEWS",
+        "SOCIAL",
+        "MACRO_CALENDAR",
+        "EARNINGS_CALENDAR",
+        "CROSS_ASSET",
+        "ONCHAIN",
+        "CRYPTO_FUNDAMENTAL"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "VerificationStatus": {
+      "enum": [
+        "VERIFIED",
+        "REPORTED",
+        "UNVERIFIED",
+        "RETRACTED"
+      ],
+      "title": "VerificationStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "evidence_id": {
+      "title": "Evidence Id",
+      "type": "string"
+    },
+    "source_kind": {
+      "$ref": "#/$defs/SourceKind"
+    },
+    "source_id": {
+      "title": "Source Id",
+      "type": "string"
+    },
+    "source_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Url"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "excerpt": {
+      "title": "Excerpt",
+      "type": "string"
+    },
+    "content_hash": {
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "content_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Ref"
+    },
+    "event_time": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Time"
+    },
+    "published_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Published At"
+    },
+    "received_at": {
+      "format": "date-time",
+      "title": "Received At",
+      "type": "string"
+    },
+    "available_at": {
+      "format": "date-time",
+      "title": "Available At",
+      "type": "string"
+    },
+    "revision": {
+      "default": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "supersedes": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Supersedes"
+    },
+    "verification_status": {
+      "$ref": "#/$defs/VerificationStatus"
+    },
+    "instrument_scope": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Instrument Scope",
+      "type": "array"
+    }
+  },
+  "required": [
+    "evidence_id",
+    "source_kind",
+    "source_id",
+    "title",
+    "excerpt",
+    "content_hash",
+    "received_at",
+    "available_at",
+    "verification_status"
+  ],
+  "title": "EvidenceItem",
+  "type": "object"
+}

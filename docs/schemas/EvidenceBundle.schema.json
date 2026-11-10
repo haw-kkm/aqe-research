@@ -1,0 +1,367 @@
+{
+  "$defs": {
+    "EvidenceItem": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "title": "Evidence Id",
+          "type": "string"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "source_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Url"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "excerpt": {
+          "title": "Excerpt",
+          "type": "string"
+        },
+        "content_hash": {
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "content_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content Ref"
+        },
+        "event_time": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event Time"
+        },
+        "published_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Published At"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        },
+        "revision": {
+          "default": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "supersedes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supersedes"
+        },
+        "verification_status": {
+          "$ref": "#/$defs/VerificationStatus"
+        },
+        "instrument_scope": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Instrument Scope",
+          "type": "array"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "source_kind",
+        "source_id",
+        "title",
+        "excerpt",
+        "content_hash",
+        "received_at",
+        "available_at",
+        "verification_status"
+      ],
+      "title": "EvidenceItem",
+      "type": "object"
+    },
+    "InstrumentKey": {
+      "additionalProperties": false,
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/Venue"
+        },
+        "market_type": {
+          "$ref": "#/$defs/MarketType"
+        },
+        "instrument_id": {
+          "title": "Instrument Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "venue",
+        "market_type",
+        "instrument_id"
+      ],
+      "title": "InstrumentKey",
+      "type": "object"
+    },
+    "MarketType": {
+      "enum": [
+        "usdm_perpetual",
+        "usdm_delivery",
+        "spot"
+      ],
+      "title": "MarketType",
+      "type": "string"
+    },
+    "ScheduledEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "scheduled_time": {
+          "format": "date-time",
+          "title": "Scheduled Time",
+          "type": "string"
+        },
+        "importance": {
+          "title": "Importance",
+          "type": "string"
+        },
+        "revision": {
+          "default": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        },
+        "actual_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual Value"
+        },
+        "actual_available_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual Available At"
+        }
+      },
+      "required": [
+        "event_id",
+        "name",
+        "source_id",
+        "scheduled_time",
+        "importance",
+        "available_at"
+      ],
+      "title": "ScheduledEvent",
+      "type": "object"
+    },
+    "SourceHealth": {
+      "additionalProperties": false,
+      "properties": {
+        "source_kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "status": {
+          "$ref": "#/$defs/SourceHealthStatus"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "last_available_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Available At"
+        }
+      },
+      "required": [
+        "source_kind",
+        "status"
+      ],
+      "title": "SourceHealth",
+      "type": "object"
+    },
+    "SourceHealthStatus": {
+      "enum": [
+        "AVAILABLE",
+        "STALE",
+        "MISSING",
+        "NOT_CONFIGURED",
+        "MARKET_CLOSED"
+      ],
+      "title": "SourceHealthStatus",
+      "type": "string"
+    },
+    "SourceKind": {
+      "enum": [
+        "MARKET_FLOW",
+        "NEWS",
+        "SOCIAL",
+        "MACRO_CALENDAR",
+        "EARNINGS_CALENDAR",
+        "CROSS_ASSET",
+        "ONCHAIN",
+        "CRYPTO_FUNDAMENTAL"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "Venue": {
+      "enum": [
+        "binance"
+      ],
+      "title": "Venue",
+      "type": "string"
+    },
+    "VerificationStatus": {
+      "enum": [
+        "VERIFIED",
+        "REPORTED",
+        "UNVERIFIED",
+        "RETRACTED"
+      ],
+      "title": "VerificationStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "bundle_id": {
+      "title": "Bundle Id",
+      "type": "string"
+    },
+    "instruments": {
+      "items": {
+        "$ref": "#/$defs/InstrumentKey"
+      },
+      "title": "Instruments",
+      "type": "array"
+    },
+    "as_of": {
+      "format": "date-time",
+      "title": "As Of",
+      "type": "string"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/EvidenceItem"
+      },
+      "title": "Items",
+      "type": "array"
+    },
+    "calendar_snapshot": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ScheduledEvent"
+      },
+      "title": "Calendar Snapshot",
+      "type": "array"
+    },
+    "source_health": {
+      "items": {
+        "$ref": "#/$defs/SourceHealth"
+      },
+      "title": "Source Health",
+      "type": "array"
+    },
+    "bundle_hash": {
+      "title": "Bundle Hash",
+      "type": "string"
+    }
+  },
+  "required": [
+    "bundle_id",
+    "instruments",
+    "as_of",
+    "items",
+    "source_health",
+    "bundle_hash"
+  ],
+  "title": "EvidenceBundle",
+  "type": "object"
+}

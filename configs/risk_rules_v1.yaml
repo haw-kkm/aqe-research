@@ -1,0 +1,26 @@
+# Versioned, deterministic risk ruleset (B10). Models/LLMs cannot change these values.
+ruleset_id: risk_rules_v1
+version: 1
+min_readiness_for_review: OOS_EVALUATED
+require_calibration_validated: true
+require_oos_skill: true
+require_cost_adjusted_edge: true
+max_clock_skew_ms: 1000
+future_tolerance_seconds: 1.0
+max_bar_staleness_seconds: 900
+required_sources:
+  ohlcv_v0: [bars]
+  flow_v1: [bars, l2, trades]
+high_event_caps_at: RESEARCH_ONLY
+event_info_unknown_caps_at: RESEARCH_ONLY
+disagreement_exceeded_caps_at: RESEARCH_ONLY
+disagreement_unknown_caps_at: RESEARCH_ONLY
+ood_caps_at: RESEARCH_ONLY
+min_quote_volume_24h: 5.0e7
+required_cost_assumptions: [taker_fee_bps, slippage_bps]
+portfolio:
+  max_gross_exposure_x_equity: 1.0
+  max_net_exposure_x_equity: 1.0
+  max_daily_loss_fraction: 0.02
+  max_snapshot_age_seconds: 3600
+  unknown_caps_at: RESEARCH_ONLY

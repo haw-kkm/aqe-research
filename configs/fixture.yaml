@@ -1,0 +1,15 @@
+# M0 fixture configuration: SYNTHETIC_FIXTURE bars, functional test only (no market claims).
+schema_version: "1.0.0"
+mode: replay
+paths:
+  data_root: "${AQE_FIXTURE_ROOT}/data"
+  artifact_root: "${AQE_FIXTURE_ROOT}/artifacts"
+instruments:
+  - {venue: binance, market_type: usdm_perpetual, instrument_id: BTCUSDT}
+backfill:
+  start: "2026-01-01T00:00:00Z"
+risk_ruleset: configs/risk_rules_v1.yaml
+analysis:
+  experiment_config: configs/experiment.yaml
+  decision_delay_seconds: 10
+fixture_bars: tests/fixtures/synthetic_bars_btcusdt_5m.csv
