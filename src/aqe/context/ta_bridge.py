@@ -217,8 +217,26 @@ def daily_ohlcv_frame(bundle: dict):
     raise NoMarketDataError("BTC-USD", "BTC-USD", "no daily OHLCV evidence in AQE bundle")
 
 
-def usage_handler(max_calls: int):
-    """LangChain callback: counts real LLM calls/tokens and aborts the run beyond max_calls (F04)."""
+def _payload_bytes(obj) -> int:
+    if obj is None:
+        return 0
+    if isinstance(obj, str):
+        return len(obj.encode("utf-8"))
+    content = getattr(obj, "content", None)
+    if content is not None:
+        return _payload_bytes(content) + 16
+    if isinstance(obj, (list, tuple)):
+        return sum(_payload_bytes(x) for x in obj)
+    try:
+        return len(json.dumps(obj, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return len(str(obj).encode("utf-8"))
+
+
+def usage_handler(max_calls: int, max_prompt_tokens: int = 10**9):
+    """LangChain callback: counts real LLM calls/tokens; aborts BEFORE a call that exceeds max_calls or whose
+    prompt upper bound (UTF-8 bytes of messages + bound tools/schemas + per-message overhead) exceeds
+    max_prompt_tokens (supplement A)."""
     from langchain_core.callbacks import BaseCallbackHandler
 
     class UsageHandler(BaseCallbackHandler):
@@ -230,17 +248,22 @@ def usage_handler(max_calls: int):
             self.prompt_tokens = 0
             self.completion_tokens = 0
 
-        def _start(self):
+        def _start(self, prompt_bound: int):
             self.calls += 1
+            AUDIT["max_prompt_bound_seen"] = max(AUDIT.get("max_prompt_bound_seen", 0), prompt_bound)
             if self.calls > max_calls:
                 AUDIT["budget_abort"] = f"LLM call {self.calls} exceeds max_llm_calls={max_calls}"
                 raise RuntimeError(AUDIT["budget_abort"])
+            if prompt_bound > max_prompt_tokens:
+                AUDIT["budget_abort"] = f"LLM call {self.calls} prompt upper bound {prompt_bound} > max_prompt_tokens={max_prompt_tokens}"
+                raise RuntimeError(AUDIT["budget_abort"])
 
-        def on_llm_start(self, *a, **k):
-            self._start()
+        def on_llm_start(self, serialized, prompts, **k):
+            self._start(_payload_bytes(prompts) + 16 * max(1, len(prompts or [])) + _payload_bytes(k.get("invocation_params")))
 
-        def on_chat_model_start(self, *a, **k):
-            self._start()
+        def on_chat_model_start(self, serialized, messages, **k):
+            msgs = [m for batch in (messages or []) for m in batch]
+            self._start(_payload_bytes(msgs) + 16 * max(1, len(msgs)) + _payload_bytes(k.get("invocation_params")))
 
         def on_llm_end(self, response, **k):
             pt = ct = None
@@ -388,7 +411,8 @@ def main() -> int:
             trading_graph.create_tier_client = lambda config, tier, **k: _Client()
         handler = None
         if llm.get("provider") != "offline_scripted":
-            handler = usage_handler(int(job.get("max_llm_calls", 40)))
+            handler = usage_handler(int(job.get("max_llm_calls", 40)), int(job.get("max_prompt_tokens", 8000)))
+            cfg["llm_max_retries"] = 0  # existing upstream key: no hidden client retries outside the call budget
         g = trading_graph.TradingAgentsGraph(selected_analysts=tuple(job.get("selected_analysts", ["market", "news"])), config=cfg,
                                              callbacks=[handler] if handler else None)
         if g.memory_log._log_path is not None:

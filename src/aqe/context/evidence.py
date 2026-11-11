@@ -126,38 +126,112 @@ CALENDAR_LOOKBACK = timedelta(days=1)
 CALENDAR_LOOKAHEAD = timedelta(days=3)
 
 
+NEWS_MAX_LAG = timedelta(hours=1)  # verified news coverage must reach at least this close to as_of
+MANIFEST_SUFFIX = ".manifest.json"
+REQUIRED_MANIFEST_KEYS = ("source_id", "fetched_at", "coverage_start", "coverage_end", "content_sha256")
+
+
+def load_import_manifests(directory: Path, data_glob: str, as_of: datetime) -> tuple[list[tuple[Path, dict]], list[str]]:
+    """Data files usable at as_of together with their manifests (supplement B).
+
+    A data file counts only if `<file>.manifest.json` exists, has the required keys, its
+    `content_sha256` matches the file, coverage_start < coverage_end, and the manifest itself was
+    available (`available_at`, default `fetched_at`) at or before as_of. Returns (usable, problems)."""
+    from aqe.storage import sha256_file
+
+    usable, problems = [], []
+    for f in sorted(directory.glob(data_glob)) if directory.exists() else []:
+        mp = f.with_name(f.name + MANIFEST_SUFFIX)
+        if not mp.exists():
+            problems.append(f"{f.name}: no manifest (coverage unverifiable)")
+            continue
+        try:
+            m = json.loads(mp.read_text(encoding="utf-8"))
+            missing = [k for k in REQUIRED_MANIFEST_KEYS if not m.get(k)]
+            if missing:
+                problems.append(f"{f.name}: manifest missing {missing}")
+                continue
+            if m["content_sha256"] != sha256_file(f):
+                problems.append(f"{f.name}: content hash differs from manifest")
+                continue
+            start, end = pd.Timestamp(m["coverage_start"]), pd.Timestamp(m["coverage_end"])
+            avail = pd.Timestamp(m.get("available_at") or m["fetched_at"])
+            if start.tzinfo is None or end.tzinfo is None or avail.tzinfo is None or not start < end:
+                problems.append(f"{f.name}: manifest times must be timezone-aware with coverage_start < coverage_end")
+                continue
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            problems.append(f"{f.name}: unreadable manifest ({type(exc).__name__})")
+            continue
+        if avail > pd.Timestamp(as_of):
+            problems.append(f"{f.name}: manifest not yet available at as_of")
+            continue
+        usable.append((f, {**m, "_start": start, "_end": end, "_avail": avail}))
+    return usable, problems
+
+
+def covering_interval(manifests: list[dict], point: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Merged coverage interval (overlapping/adjacent manifests chained) that contains `point`."""
+    spans = sorted((m["_start"], m["_end"]) for m in manifests)
+    merged: list[list[pd.Timestamp]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    for s, e in merged:
+        if s <= point <= e:
+            return s, e
+    return None
+
+
 def calendar_events(cfg: LocalConfig, as_of: datetime) -> tuple[list[ScheduledEvent], SourceHealth]:
     d = cfg.paths.data_root / "imports" / "calendar"
-    files = sorted(d.glob("*.csv")) if d.exists() else []
-    if not files:
+    if not d.exists() or not any(d.glob("*.csv")):
         return [], SourceHealth(source_kind=SourceKind.MACRO_CALENDAR, status=SourceHealthStatus.NOT_CONFIGURED,
                                 detail="no verified calendar import; macro/earnings schedule unknown")
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    usable, problems = load_import_manifests(d, "*.csv", as_of)
+    if not usable:
+        return [], SourceHealth(source_kind=SourceKind.MACRO_CALENDAR, status=SourceHealthStatus.MISSING,
+                                detail="no calendar import usable at as_of: " + "; ".join(problems[:5]))
+    cover = covering_interval([m for _, m in usable], pd.Timestamp(as_of))
+    df = pd.concat([pd.read_csv(f) for f, _ in usable], ignore_index=True)
     for c in ("scheduled_time", "available_at", "actual_available_at"):
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], utc=True)
-    df = df[df["available_at"] <= pd.Timestamp(as_of)]
-    df = df.sort_values(["event_id", "revision"]).groupby("event_id").tail(1)
-    win = (df["scheduled_time"] >= pd.Timestamp(as_of - CALENDAR_LOOKBACK)) & (df["scheduled_time"] <= pd.Timestamp(as_of + CALENDAR_LOOKAHEAD))
+    if len(df):
+        df = df[df["available_at"] <= pd.Timestamp(as_of)]
+        df = df.sort_values(["event_id", "revision"]).groupby("event_id").tail(1)
+        win = (df["scheduled_time"] >= pd.Timestamp(as_of - CALENDAR_LOOKBACK)) & (df["scheduled_time"] <= pd.Timestamp(as_of + CALENDAR_LOOKAHEAD))
+        df = df[win]
     out = []
-    for _, r in df[win].iterrows():
+    for _, r in df.iterrows():
         actual_ok = "actual_available_at" in r and pd.notna(r.get("actual_available_at")) and r["actual_available_at"] <= pd.Timestamp(as_of)
         out.append(ScheduledEvent(event_id=str(r["event_id"]), name=str(r["name"]), source_id=str(r["source_id"]),
                                   scheduled_time=r["scheduled_time"].to_pydatetime(), importance=str(r["importance"]).upper(),
                                   revision=int(r["revision"]), available_at=r["available_at"].to_pydatetime(),
                                   actual_value=str(r["actual_value"]) if actual_ok and pd.notna(r.get("actual_value")) else None,
                                   actual_available_at=r["actual_available_at"].to_pydatetime() if actual_ok else None))
-    return out, SourceHealth(source_kind=SourceKind.MACRO_CALENDAR, status=SourceHealthStatus.AVAILABLE, detail=f"{len(out)} events in window")
+    if cover is None:
+        spans = ", ".join(f"{m['_start'].date()}..{m['_end'].date()}" for _, m in usable[:5])
+        return out, SourceHealth(source_kind=SourceKind.MACRO_CALENDAR, status=SourceHealthStatus.STALE,
+                                 detail=f"verified calendar coverage ({spans}) does not include as_of; {len(out)} known events")
+    return out, SourceHealth(source_kind=SourceKind.MACRO_CALENDAR, status=SourceHealthStatus.AVAILABLE,
+                             detail=f"{len(out)} events in window; verified coverage {cover[0].isoformat()}..{cover[1].isoformat()}",
+                             last_available_at=max(m["_avail"] for _, m in usable).to_pydatetime(),
+                             coverage_start=cover[0].to_pydatetime(), coverage_end=cover[1].to_pydatetime())
 
 
 def news_items(cfg: LocalConfig, as_of: datetime) -> tuple[list[EvidenceItem], SourceHealth]:
     d = cfg.paths.data_root / "imports" / "news"
-    files = sorted(d.glob("*.jsonl")) if d.exists() else []
-    if not files:
+    if not d.exists() or not any(d.glob("*.jsonl")):
         return [], SourceHealth(source_kind=SourceKind.NEWS, status=SourceHealthStatus.NOT_CONFIGURED,
                                 detail="no verified news import/API configured")
+    usable, problems = load_import_manifests(d, "*.jsonl", as_of)
+    if not usable:
+        return [], SourceHealth(source_kind=SourceKind.NEWS, status=SourceHealthStatus.MISSING,
+                                detail="no news import usable at as_of: " + "; ".join(problems[:5]))
     items = []
-    for f in files:
+    for f, _ in usable:
         for line in f.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -169,8 +243,14 @@ def news_items(cfg: LocalConfig, as_of: datetime) -> tuple[list[EvidenceItem], S
                                published_at=pd.Timestamp(r["published_at"]).to_pydatetime() if r.get("published_at") else None,
                                received_at=pd.Timestamp(r["received_at"]).to_pydatetime(), url=r.get("source_url"),
                                status=VerificationStatus(r.get("verification_status", "UNVERIFIED"))))
-    return items, SourceHealth(source_kind=SourceKind.NEWS, status=SourceHealthStatus.AVAILABLE if items else SourceHealthStatus.STALE,
-                               detail=f"{len(items)} items in last 3 days")
+    # news coverage can only extend up to when it was fetched; it must reach close to as_of
+    cover = covering_interval([m for _, m in usable], pd.Timestamp(as_of - NEWS_MAX_LAG))
+    if cover is None or cover[1] < pd.Timestamp(as_of - NEWS_MAX_LAG):
+        return items, SourceHealth(source_kind=SourceKind.NEWS, status=SourceHealthStatus.STALE,
+                                   detail=f"verified news coverage does not reach as_of - {NEWS_MAX_LAG}; {len(items)} items")
+    return items, SourceHealth(source_kind=SourceKind.NEWS, status=SourceHealthStatus.AVAILABLE,
+                               detail=f"{len(items)} items in last 3 days; verified coverage {cover[0].isoformat()}..{cover[1].isoformat()}",
+                               coverage_start=cover[0].to_pydatetime(), coverage_end=cover[1].to_pydatetime())
 
 
 def build_bundle(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> EvidenceBundle:

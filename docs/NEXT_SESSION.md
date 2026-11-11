@@ -1,13 +1,14 @@
-# NEXT_SESSION — 다음 세션 시작점 (갱신: 2026-11-11 KST, 세션 2 — 코드 리뷰 6c9ae84 대응 후)
+# NEXT_SESSION — 다음 세션 시작점 (갱신: 2026-11-11 KST, 세션 3 — 후속 검토 보완 A/B 후)
 
-세션 2 요약: 리뷰 F01–F06 수정·회귀 시험 36개 추가(총 93 passed), 재현 스크립트 수정 전/후 결과 `docs/review/`.
-잠금 시험은 재실행하지 않았다(ledger trial 2). 기존 모델·평가 결과는 그대로이며 비용 후 손실 기록을 보존한다.
+세션 2: 리뷰 F01–F06 수정(커밋 efe19f4로 원격 반영됨). 세션 3: 후속 검토의 보완 A(비용 상한 강제)·B(일정/뉴스 manifest)
+수정, 시험 109 passed. 세션 3 변경은 아직 커밋하지 않았다. 잠금 시험은 재실행하지 않았다(ledger trial 2).
+기존 LightGBM·TCN·메타·보정기는 그대로 유지한다 — 방어 코드 수정만으로 재학습할 이유는 없다.
 
 먼저 읽을 것: `AQE_TradingAgents_Blueprint_KO.md` → `BUILD_STATUS.md` → 이 파일 → `docs/DECISIONS.md`.
 이미 된 작업을 재생성하지 말 것. 데이터·artifact는 아래 경로에 실제로 존재한다(없으면 있다고 가정하지 말고 `aqe doctor`로 확인).
 
 ## 현재 존재하는 것
-- 코드: `C:\vscode\aqe` (Git 저장소, origin `haw-kkm/aqe-research`, 리뷰 대상 커밋 6c9ae84; 세션 2 변경은 미커밋). venv: `.venv`(core, torch 2.15.0+cu132), `.venv-ta`(TradingAgents 0.7.1 @ 9fa1196…).
+- 코드: `C:\vscode\aqe` (Git 저장소, origin `haw-kkm/aqe-research`; HEAD efe19f4 = 세션 2 반영, 세션 3 보완 A/B는 미커밋). venv: `.venv`(core, torch 2.15.0+cu132), `.venv-ta`(TradingAgents 0.7.1 @ 9fa1196…).
 - 데이터 `E:\aqe-v2\data`: `normalized/bars/.../5m`(REST, 754,5xx 확정 봉), `5m_live`(LIVE_CAPTURE 소량), `funding/`, `oi_hist/`(최근 29일),
   `flow_summaries/`·`mark_funding_estimates/`·`oi_observations/`(수집기 2회 단기 실행분), `raw/`(gzip 원본), `manifests/`, `meta/aqe_meta.sqlite`,
   `context/`(bundle·오프라인 TA 실행 결과), `reports/`, `runs/`, `status/`.
@@ -19,13 +20,13 @@
 1. 시스템 시계 +62~64초(드리프트) → Windows 자동 시간 동기화(관리자). 해결 전 research/shadow 분석은 R2로 ABSTAIN.
 2. PostgreSQL/TimescaleDB 미설치 → `AQE_PG_DSN` 제공 시 `aqe init-db`로 migration 적용·검증.
 3. LLM 공급자/모델/키/가격표/일일 비용 상한 미정 → TradingAgents·단순 LLM 실연결 BLOCKED.
-4. 뉴스·일정·교차자산 공급자 미정 → 현재는 검증된 파일 import 형식만 지원.
+4. 뉴스·일정·교차자산 공급자 미정 → 현재는 manifest가 붙은 검증된 파일 import만 지원(`docs/IMPORT_FORMATS.md`).
 
 ## 정확한 다음 명령
 ```powershell
 cd C:\vscode\aqe
 .venv\Scripts\aqe doctor --config configs\local.yaml            # clock 항목이 OK인지 먼저 확인
-.venv\Scripts\python -m pytest -q                              # 93 passed 기대
+.venv\Scripts\python -m pytest -q                              # 109 passed 기대
 # 상시 수집(flow_v1 축적) — 별도 창
 powershell -ExecutionPolicy Bypass -File deploy\windows\supervise.ps1 -Command collect -Config configs\local.yaml
 # shadow 전향 로그: configs\local.yaml 복사 → configs\shadow.yaml 에서 mode: shadow 로 변경 후
@@ -48,6 +49,7 @@ context:
 ## 남은 구현 작업 (우선순위)
 1. (G01) `5m_live`와 `5m` 병합 계층(LIVE_CAPTURE/REST를 버전·수신·가용 시각과 함께 조회, provenance 유지)과 shadow 예측 → 성숙 라벨 채점기.
 1b. LLM 공급자 결정 후 실 LLM 1건: P10 사용량 callback이 실제 응답에서 토큰을 읽는지, 예약·정산이 맞는지 확인(상한은 작게).
+    바이트 기반 프롬프트 상한은 보수적이므로 실제 근거 묶음 크기에 맞춰 `max_prompt_tokens_per_call`을 조정해야 할 수 있다.
 2. (G02) context 피처 계약·시점 결합 데이터셋·numeric_context 메타 학습기·동일 조건 E4/E5 평가기 — 전향 context 기록이 쌓인 뒤.
 3. flow_v1 피처(L2 불균형·spread·depth·CVD·OI 변화·funding) 계산기 + 별도 프로필 artifact. 데이터 축적 후 학습.
 4. shadow 전향 평가 집계기(보고서 → 성숙 라벨과 대조, generated_at 기준 판단 시각).

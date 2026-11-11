@@ -414,6 +414,19 @@
       "title": "Coverage",
       "type": "object"
     },
+    "calendar_coverage_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Calendar Coverage Until"
+    },
     "temporal_scope": {
       "$ref": "#/$defs/TemporalScope"
     },

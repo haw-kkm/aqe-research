@@ -29,7 +29,7 @@ CREATE INDEX IF NOT EXISTS context_jobs_status_idx ON context_jobs (status, crea
 CREATE TABLE IF NOT EXISTS context_usage_daily (
   day TEXT NOT NULL, backend TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0, cost_unknown_calls INTEGER NOT NULL DEFAULT 0,
-  reserved_usd REAL NOT NULL DEFAULT 0, PRIMARY KEY (day, backend));
+  reserved_usd REAL NOT NULL DEFAULT 0, budget_overruns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, backend));
 CREATE TABLE IF NOT EXISTS ingestion_health (
   source TEXT NOT NULL, instrument_id TEXT NOT NULL, observed_at TEXT NOT NULL, status TEXT NOT NULL,
   detail TEXT, clock_offset_ms REAL, PRIMARY KEY (source, instrument_id, observed_at));
@@ -64,6 +64,9 @@ def init_sqlite(path: Path) -> None:
         if "reserved_usd" not in cols:  # additive migration (review F04)
             c.execute("ALTER TABLE context_usage_daily ADD COLUMN reserved_usd REAL NOT NULL DEFAULT 0")
             c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_002_budget_reservation", iso_utc(utc_now())))
+        if "budget_overruns" not in cols:  # additive migration (supplement A): actual cost exceeded the reservation
+            c.execute("ALTER TABLE context_usage_daily ADD COLUMN budget_overruns INTEGER NOT NULL DEFAULT 0")
+            c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_003_budget_overruns", iso_utc(utc_now())))
 
 
 def init_db(cfg: LocalConfig, rec: RunRecord) -> int:
@@ -162,21 +165,37 @@ class JobQueue:
         day = utc_now().strftime("%Y-%m-%d")
         with connect(self.path) as c:
             r = c.execute("SELECT * FROM context_usage_daily WHERE day=? AND backend=?", (day, backend)).fetchone()
-            return dict(r) if r else {"day": day, "backend": backend, "calls": 0, "cost_usd": 0.0, "cost_unknown_calls": 0, "reserved_usd": 0.0}
+            return dict(r) if r else {"day": day, "backend": backend, "calls": 0, "cost_usd": 0.0, "cost_unknown_calls": 0,
+                                      "reserved_usd": 0.0, "budget_overruns": 0}
+
+    @staticmethod
+    def _totals(c, day: str) -> dict[str, Any]:
+        r = c.execute("SELECT coalesce(sum(calls),0) calls, coalesce(sum(cost_usd),0) cost_usd, coalesce(sum(reserved_usd),0) reserved_usd, "
+                      "coalesce(sum(cost_unknown_calls),0) cost_unknown_calls, coalesce(sum(budget_overruns),0) budget_overruns "
+                      "FROM context_usage_daily WHERE day=?", (day,)).fetchone()
+        return dict(r)
+
+    def usage_totals_today(self) -> dict[str, Any]:
+        """Project-wide totals over all context backends (the daily budget is project-wide)."""
+        day = utc_now().strftime("%Y-%m-%d")
+        with connect(self.path) as c:
+            return {"day": day, **self._totals(c, day)}
 
     def try_reserve(self, backend: str, estimate_usd: float, cap_usd: float | None, max_calls: int, calls: int,
                     paid: bool) -> tuple[bool, str]:
-        """Atomically check limits and reserve `estimate_usd` (paid) / count calls. Returns (ok, reason)."""
+        """Atomically check PROJECT-WIDE daily limits (all backends) and reserve. Returns (ok, reason)."""
         day = utc_now().strftime("%Y-%m-%d")
         with connect(self.path) as c:
             c.execute("BEGIN IMMEDIATE")
             c.execute("INSERT OR IGNORE INTO context_usage_daily (day, backend) VALUES (?, ?)", (day, backend))
-            u = dict(c.execute("SELECT * FROM context_usage_daily WHERE day=? AND backend=?", (day, backend)).fetchone())
+            u = self._totals(c, day)
             reason = ""
             if u["calls"] + calls > max_calls:
-                reason = f"daily call cap {max_calls} would be exceeded ({u['calls']} used, {calls} requested)"
+                reason = f"daily call cap {max_calls} (all backends) would be exceeded ({u['calls']} used, {calls} requested)"
             elif paid and u["cost_unknown_calls"] > 0:
                 reason = f"{u['cost_unknown_calls']} paid call(s) today have unknown cost; reconcile before further paid calls"
+            elif paid and u["budget_overruns"] > 0:
+                reason = f"{u['budget_overruns']} job(s) today cost more than their reservation; review limits before further paid calls"
             elif paid and (cap_usd is None or cap_usd <= 0):
                 reason = "max_cost_usd_per_day is 0: paid LLM calls are not permitted"
             elif paid and u["cost_usd"] + u["reserved_usd"] + estimate_usd > cap_usd:
@@ -205,8 +224,10 @@ class JobQueue:
                           "cost_unknown_calls=cost_unknown_calls+1, calls=calls+? WHERE day=? AND backend=?",
                           (reserved_usd, reserved_usd, extra_calls, day, backend))
             else:
+                over = 1 if actual_usd > reserved_usd + 1e-12 else 0  # provider ignored limits / estimate wrong
                 c.execute("UPDATE context_usage_daily SET reserved_usd=max(0, reserved_usd-?), cost_usd=cost_usd+?, "
-                          "calls=calls+? WHERE day=? AND backend=?", (reserved_usd, actual_usd, extra_calls, day, backend))
+                          "budget_overruns=budget_overruns+?, calls=calls+? WHERE day=? AND backend=?",
+                          (reserved_usd, actual_usd, over, extra_calls, day, backend))
             c.execute("COMMIT")
 
     def add_usage(self, backend: str, calls: int, cost_usd: float | None) -> None:

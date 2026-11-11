@@ -40,12 +40,23 @@
 - Replay/online use them only for `as_of >= established_at`. Earlier as_of → readiness TRAINED_UNVALIDATED,
   calibration not validated, positive verdicts `NOT_ESTABLISHED_AT_AS_OF`. Blocking verdicts (e.g. NOT_POSITIVE)
   are applied to any as_of (stopping use on current knowledge is allowed; claiming past knowledge is not).
+  Such a replay is a conservative re-run under today's usage restrictions, NOT an evaluation of what a historical
+  trading policy could have known; historical policy performance must only use knowledge available at each as_of.
 
 ## ADR-0008 — LLM budget: reserve, settle, block on unknown (review F04)
 - Before a paid job: atomically reserve calls × (max_prompt_tokens + max_output_tokens) × price table.
 - After: settle with the actual cost; if unknown (missing usage, timeout, failure after send) the reservation is
   booked as cost and `cost_unknown_calls` blocks further paid calls that day until a human reconciles
   (docs/OPERATIONS.md). `ollama`/`openai_compatible` count as free only on a loopback base URL.
+
+- Follow-up (supplement A): the reservation is a true bound only if the prompt bound is checked before every call
+  (UTF-8 bytes + per-message overhead; TA callback per graph call), the output cap is sent to the provider,
+  hidden client retries are disabled (`llm_max_retries=0`), and the daily cap/call cap/blocks are project-wide
+  across backends. Actual > reserved => `budget_overruns` blocks further paid calls that day.
+
+## ADR-0010 — Evidence imports need a verifiable manifest (supplement B)
+- A calendar/news file counts only with a manifest (fetched/available time, coverage interval, content SHA-256)
+  available at as_of. Coverage = manifest interval (never as_of + lookahead). See docs/IMPORT_FORMATS.md.
 
 ## ADR-0009 — Unknown event information is not 'no event' (review F05)
 - Event risk passes only with AVAILABLE `event_required_sources` (MACRO_CALENDAR, NEWS), an

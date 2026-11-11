@@ -1,6 +1,6 @@
 # BUILD_STATUS — AQE 신규 구축
 
-기준: `AQE_TradingAgents_Blueprint_KO.md` v1.0 (SHA-256 `1abd54b6…`, 프롬프트 명시값과 일치) · 갱신: 2026-11-11 KST (세션 1 + 세션 2: 코드 리뷰 6c9ae84 대응)
+기준: `AQE_TradingAgents_Blueprint_KO.md` v1.0 (SHA-256 `1abd54b6…`, 프롬프트 명시값과 일치) · 갱신: 2026-11-11 KST (세션 1 + 세션 2: 리뷰 6c9ae84 대응 → 커밋 efe19f4 + 세션 3: 후속 검토 보완 A/B)
 상태 값: `NOT_STARTED` · `IN_PROGRESS` · `DONE` · `BLOCKED` · `PENDING_VALIDATION`. 모델 준비도는 별도 열.
 실행 위치: 코드 `C:\vscode\aqe` · data_root `E:\aqe-v2\data` · artifact_root `E:\aqe-v2\artifacts` (Git 제외).
 
@@ -18,6 +18,8 @@
 | F04 | 비용 미확정 후에도 유료 호출 허용 | **DONE (오프라인 검증)** | 원자적 예약·정산, 미확정 비용 → 당일 유료 호출 차단, 이름만으로 무료 간주 금지, TA 사용량 callback·호출 상한; 재현 → 거부. 실 과금 호출로는 미검증 |
 | F05 | 일정·뉴스 미확보를 이벤트 위험 PASS로 처리 | **DONE** | 필수 근거 AVAILABLE + 시점 검증 + 일정 범위 ≥ 기간일 때만 PASS; 재현 → UNKNOWN/RESEARCH_ONLY |
 | F06 | 예측 캐시가 입력 버전 무시 | **DONE** | 캐시 키 = artifact + 모델 파일 해시 + 입력 내용 해시 + 피처; OOS manifest–데이터셋 일치 검사; 재현 → 재계산 1회 |
+| 보완 A (efe19f4 검토) | 비용 예약의 토큰 가정이 실제 상한으로 강제되지 않음 | **DONE (mock 검증)** | 호출 전 프롬프트 상한 검사, 출력 상한 전달, TA 호출별 프롬프트 상한·`llm_max_retries=0`, 예약 초과 시 차단, 일일 예산 backend 합산; `tests/test_supplement_ab.py`; `docs/review/FOLLOWUP_2026-11-11_efe19f4.md` |
+| 보완 B (efe19f4 검토) | 일정 커버리지를 파일 존재로 추정 | **DONE** | import manifest(가용 시각·커버리지 구간·내용 해시) 필수, 커버리지 = manifest 구간; 뉴스 동일; `docs/IMPORT_FORMATS.md` |
 | G01 | 실시간 봉 병합·shadow 채점 | NOT_STARTED | NEXT_SESSION 작업 1·4 |
 | G02 | E4/E5·numeric_context 구현 | NOT_STARTED | API 키 외에 context 피처 계약·시점 결합 데이터셋·학습기·평가기 필요 |
 | G03 | 성능 해석 표기 | **DONE** | 평가 보고: '거래별 순수익률 산술합', 'MDD(log 단위)', E3 대 E1 미검정, ECE 한계 명시. 잠금 결과 보존(재실행 안 함) |
@@ -51,7 +53,7 @@
 | R11 비용 포함 비교 검증 | DONE (E0–E3) / BLOCKED (E4–E5) | `evaluation/ledger.jsonl` (trial 2회 기록), 비용·×2·지연 스트레스 |
 | R12 재시작·운영·인수인계 | PENDING_VALIDATION | 복구 시험(T13), OPERATIONS.md, 이 파일, NEXT_SESSION.md / 장기 운영 미검증 |
 
-## 3. 시험 (T01–T14) — `.venv\Scripts\python -m pytest -q` → **93 passed** (2026-11-11 세션 2; 세션 1은 57)
+## 3. 시험 (T01–T14) — `.venv\Scripts\python -m pytest -q` → **109 passed** (2026-11-11 세션 3; 세션 2는 93, 세션 1은 57)
 
 | ID | 상태 | 시험 |
 |---|---|---|
@@ -69,13 +71,14 @@
 | T12 | DONE | 롱·숏·수수료·불리한 체결·funding 부호/경계 |
 | T13 | DONE | lease 만료 회수, stale 완료 거부, 이중 완료 금지, 원본 로그 crash 복구, 수집기 재시작 dedup |
 | T14 | DONE | 주문 엔드포인트·서명 코드 부재 스캔, REST allow-list, `execution_enabled` 리터럴 False |
+| 보완 A/B | DONE | `tests/test_supplement_ab.py` (16): 리뷰 mock(1토큰 가정) 호출 전 거부, 출력 상한 전달, 상한 무시 제공자 차단, backend 합산 예산, TA callback 중단, manifest 없음·미래 가용·변조·구간 역전·오래된 파일·짧은 구간, 번들 해시 하위 호환 |
 | 리뷰 F01–F06 | DONE | `tests/test_review_fixes.py` (36): 미래 학습 meta/calibrator, 다른 horizon·상품, 지식 시점, lineage, 직접 IP·socketpair·프록시, 예약·정산·미확정 비용, 이벤트 근거 미확보, 캐시 입력 변경 |
 
 ## 4. 모델 준비도 (작업 상태와 별도)
 
 | 모델 | 코드 구현 | 실제 학습 | OOS 평가(잠금 시험) | 전향 평가 | 준비도 |
 |---|---|---|---|---|---|
-| LightGBM 1h / 24h | DONE | DONE (2019-09~2024-12 라벨) | DONE | NOT_STARTED | OOS_EVALUATED (2026-11-10 19:40Z 이후 as_of에서만; 그 이전 replay에서는 TRAINED_UNVALIDATED) |
+| LightGBM 1h / 24h | DONE | DONE (2019-09~2024-12 라벨) | DONE | NOT_STARTED | OOS_EVALUATED (2026-11-10 19:40Z 이후 as_of에서만; 그 이전 replay에서는 TRAINED_UNVALIDATED — 학습은 됐지만 당시엔 검증 결과가 없었다는 뜻) |
 | 작은 TCN 1h / 24h | DONE | DONE (GPU) | DONE | NOT_STARTED | OOS_EVALUATED |
 | 메타(numeric_only) 1h / 24h | DONE | DONE (fold OOS 입력) | DONE | NOT_STARTED | OOS_EVALUATED |
 | 온도 보정(numeric_only) | DONE | DONE (2025-01~06) | DONE (시험 ECE ≤0.05 → validated) | NOT_STARTED | OOS_EVALUATED |
@@ -110,7 +113,7 @@ LGBM·TCN 손실 상관 1h 0.91 / 24h 0.73 → TCN 추가 이득은 작다(B07.3
 | `aqe context-enqueue` + `aqe context-worker --once` (`configs/ta_offline.yaml`) | exit 0, 실제 TA 그래프 오프라인 실행 assessment `ctx-02bae1836d76` (분석에는 사용 안 됨: offline_scripted 제외) |
 | `aqe analyze --config configs/local.yaml` | exit 0, 1h/24h ABSTAIN (R2: 시계 +62s) |
 | `aqe analyze --config configs/replay.yaml --as-of 2026-03-02T00:00:10Z` | exit 0, 1h/24h RESEARCH_ONLY (R4 비용 판정 NOT_POSITIVE, 근거·포트폴리오 UNKNOWN) |
-| `pytest -q` | 세션 1: 57 passed / 세션 2(리뷰 대응 후): 93 passed |
+| `pytest -q` | 세션 1: 57 passed / 세션 2(리뷰 대응 후): 93 passed / 세션 3(보완 A/B 후): 109 passed |
 | 리뷰 재현 스크립트 (수정 전/후) | 수정 전 F01–F06 모두 결함 재현 → 수정 후 모두 거부·차단·재계산 (`docs/review/`) |
 | `aqe analyze --config configs/replay.yaml --as-of 2026-03-02T00:00:10Z` (세션 2) | exit 0, RESEARCH_ONLY: 당시 미확정 검증은 인정 안 함(준비도 TRAINED_UNVALIDATED, 보정 검증 False) |
 | `aqe analyze --config configs/local.yaml` (세션 2) | exit 0, ABSTAIN (R2: 시계 +64.0s) |

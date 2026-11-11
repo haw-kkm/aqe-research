@@ -48,7 +48,7 @@ py -V:3.12 -m venv .venv-ta
 - 시스템 시계가 거래소 대비 약 +62초: research/shadow 분석은 R2 규칙으로 ABSTAIN. Windows 자동 시간 동기화 필요.
 - PostgreSQL/TimescaleDB 미설치 → migration 미실행(BLOCKED), 로컬 SQLite 사용(ADR-0002).
 - LLM API 키·비용 상한 미설정 → TradingAgents/단순 LLM 실연결 BLOCKED. 실제 그래프는 오프라인 스크립트 모델로 배선·격리만 검증.
-- 뉴스·일정·소셜·교차자산·온체인 공급자 미연결(NOT_CONFIGURED). 검증된 파일 import 경로만 존재(`{data_root}/imports/calendar/*.csv`, `imports/news/*.jsonl`).
+- 뉴스·일정·소셜·교차자산·온체인 공급자 미연결(NOT_CONFIGURED). manifest가 붙은 검증된 파일 import만 지원(`docs/IMPORT_FORMATS.md`).
 - 과거 캔들은 `ASSUMED_LATENCY_REPLAY`(사후 다운로드). L2/aggTrade/OI 흐름(`flow_v1`)은 지금부터 수집해야 학습 가능.
 
 ## 데이터 준비 절차

@@ -34,7 +34,6 @@ from aqe.contracts.context import (
     SourceKind,
     TemporalScope,
 )
-from aqe.context.evidence import CALENDAR_LOOKAHEAD
 from aqe.contracts.core import iso_utc, utc_now
 
 PROMPT_VERSION = "aqe-simple-llm-v1"
@@ -81,10 +80,12 @@ def coverage(bundle: EvidenceBundle) -> dict[str, str]:
 def _base(bundle: EvidenceBundle, backend: str, ttl: int, **kw) -> dict[str, Any]:
     now = utc_now()
     valid_until = max(bundle.as_of, now) + timedelta(seconds=ttl) if kw.pop("live", False) else bundle.as_of + timedelta(seconds=ttl)
-    cal_ok = any(h.source_kind == SourceKind.MACRO_CALENDAR and h.status == SourceHealthStatus.AVAILABLE for h in bundle.source_health)
+    # coverage comes ONLY from a verified import manifest interval, never from as_of + lookahead (supplement B)
+    cal_cover = [h.coverage_end for h in bundle.source_health if h.source_kind == SourceKind.MACRO_CALENDAR
+                 and h.status == SourceHealthStatus.AVAILABLE and h.coverage_end is not None]
     return dict(assessment_id=f"ctx-{uuid.uuid4().hex[:12]}", instrument=bundle.instruments[0], as_of=bundle.as_of, backend=backend,
                 bundle_id=bundle.bundle_id, bundle_hash=bundle.bundle_hash, coverage=coverage(bundle),
-                calendar_coverage_until=bundle.as_of + CALENDAR_LOOKAHEAD if cal_ok else None,
+                calendar_coverage_until=min(cal_cover) if cal_cover else None,
                 event_flags=event_flags_from_bundle(bundle), generated_at=now, valid_until=valid_until, **kw)
 
 
@@ -122,6 +123,20 @@ def is_free_local(provider: str | None, base_url: str | None) -> bool:
     return False
 
 
+MESSAGE_OVERHEAD_TOKENS = 16
+
+
+def prompt_token_upper_bound(*parts: str) -> int:
+    """Provable upper bound for byte-level BPE tokenizers (OpenAI/Llama/Qwen-style): each token covers at
+    least one UTF-8 byte, plus a fixed per-message formatting overhead. Deliberately conservative."""
+    return sum(len(p.encode("utf-8")) for p in parts) + MESSAGE_OVERHEAD_TOKENS * max(1, len(parts))
+
+
+def output_limit_field(provider: str | None) -> str:
+    """OpenAI's current chat API uses max_completion_tokens; OpenAI-compatible servers use max_tokens."""
+    return "max_completion_tokens" if provider == "openai" else "max_tokens"
+
+
 def job_cost_estimate(cfg: LocalConfig, calls: int) -> float | None:
     """Upper-bound reservation for a number of LLM calls from the explicit price table (None = no price table)."""
     llm = cfg.context.llm
@@ -140,13 +155,15 @@ def _budget_ok(cfg: LocalConfig, queue, backend: str, provider: str | None, base
     paid = not is_free_local(provider, base_url)
     if queue is None:
         return (False, "no usage ledger: budget cannot be enforced") if paid else (True, "")
-    u = queue.usage_today(backend)
+    u = queue.usage_totals_today()  # the daily budget/call cap is project-wide (all context backends)
     if u["calls"] + calls > cfg.context.max_calls_per_day:
         return False, f"daily call cap {cfg.context.max_calls_per_day} would be exceeded"
     if not paid:
         return True, ""
     if u.get("cost_unknown_calls", 0) > 0:
         return False, f"{u['cost_unknown_calls']} paid call(s) today have unknown cost; reconcile before further paid calls"
+    if u.get("budget_overruns", 0) > 0:
+        return False, f"{u['budget_overruns']} job(s) today cost more than their reservation"
     if cfg.context.max_cost_usd_per_day <= 0:
         return False, "max_cost_usd_per_day is 0: paid LLM calls are not permitted"
     est = job_cost_estimate(cfg, calls)
@@ -220,6 +237,13 @@ class SimpleLLMBackend:
         key = resolve_secret(llm.api_key_env)
         if not is_free_local(llm.provider, llm.base_url) and not key:
             return missing(bundle, self.name, ContextStatus.MISSING, f"API key env {llm.api_key_env} not set", self.cfg.context.ttl_seconds, **common)
+        user = self._evidence_text(bundle)
+        bound = prompt_token_upper_bound(SIMPLE_SYSTEM, user)
+        if bound > llm.max_prompt_tokens_per_call:
+            # refuse BEFORE reserving/calling: the reservation must be a true upper bound (supplement A)
+            return missing(bundle, self.name, ContextStatus.MISSING,
+                           f"prompt upper bound {bound} tokens exceeds max_prompt_tokens_per_call={llm.max_prompt_tokens_per_call}",
+                           self.cfg.context.ttl_seconds, **common)
         ok, why, reserved, paid = reserve_budget(self.cfg, self.queue, self.name, llm.provider, llm.base_url, calls=1)
         if not ok:
             return missing(bundle, self.name, ContextStatus.MISSING, why, self.cfg.context.ttl_seconds, **common)
@@ -228,7 +252,6 @@ class SimpleLLMBackend:
             if self.queue is not None:
                 self.queue.settle(self.name, reserved, cost, paid)
 
-        user = self._evidence_text(bundle)
         t0 = time.time()
         try:
             with httpx.Client(timeout=self.cfg.context.job_timeout_seconds, transport=self.transport) as client:
@@ -245,6 +268,7 @@ class SimpleLLMBackend:
                     base = llm.base_url or ("http://localhost:11434/v1" if llm.provider == "ollama" else "https://api.openai.com/v1")
                     r = client.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"} if key else {},
                                     json={"model": llm.model_id, "temperature": llm.temperature, "response_format": {"type": "json_object"},
+                                          output_limit_field(llm.provider): llm.max_output_tokens,
                                           "messages": [{"role": "system", "content": SIMPLE_SYSTEM}, {"role": "user", "content": user}]})
                     r.raise_for_status()
                     d = r.json()
@@ -323,6 +347,7 @@ class TradingAgentsBackend:
                    "trade_date": bundle.as_of.strftime("%Y-%m-%d"), "selected_analysts": ta.selected_analysts,
                    "max_debate_rounds": ta.max_debate_rounds, "max_risk_discuss_rounds": ta.max_risk_discuss_rounds,
                    "expected_sha": ta.upstream_sha, "allow_hosts": [h for h in allow if h], "max_llm_calls": max_calls,
+                   "max_prompt_tokens": llm.max_prompt_tokens_per_call,
                    "llm": {"provider": llm.provider, "model_id": llm.model_id, "backend_url": llm.base_url, "temperature": llm.temperature,
                            "max_tokens": llm.max_output_tokens}}
         inp, outp = work / "job.json", work / "result.json"

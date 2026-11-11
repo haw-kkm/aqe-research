@@ -76,6 +76,9 @@ class SourceHealth(StrictModel):
     status: SourceHealthStatus
     detail: str = ""
     last_available_at: UTCDateTime | None = None
+    # verified coverage interval from an import manifest (None = coverage not verified)
+    coverage_start: UTCDateTime | None = None
+    coverage_end: UTCDateTime | None = None
 
 
 def compute_bundle_hash(
@@ -90,7 +93,10 @@ def compute_bundle_hash(
         "as_of": iso_utc(as_of),
         "items": sorted((it.evidence_id, it.content_hash, it.revision) for it in items),
         "calendar": sorted((e.event_id, e.revision, iso_utc(e.scheduled_time)) for e in calendar),
-        "health": sorted((h.source_kind.value, h.status.value) for h in health),
+        # coverage is hashed only when present, so bundles stored before coverage existed keep their hash
+        "health": sorted((h.source_kind.value, h.status.value)
+                         + ((iso_utc(h.coverage_start) if h.coverage_start else "", iso_utc(h.coverage_end)) if h.coverage_end else ())
+                         for h in health),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
