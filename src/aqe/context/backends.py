@@ -30,8 +30,11 @@ from aqe.contracts.context import (
     ContextUsage,
     EventFlag,
     EvidenceBundle,
+    SourceHealthStatus,
+    SourceKind,
     TemporalScope,
 )
+from aqe.context.evidence import CALENDAR_LOOKAHEAD
 from aqe.contracts.core import iso_utc, utc_now
 
 PROMPT_VERSION = "aqe-simple-llm-v1"
@@ -46,7 +49,6 @@ SIMPLE_SYSTEM = (
 LLM_HOSTS = {"openai": "api.openai.com", "anthropic": "api.anthropic.com", "google": "generativelanguage.googleapis.com",
              "openrouter": "openrouter.ai", "deepseek": "api.deepseek.com", "groq": "api.groq.com", "xai": "api.x.ai",
              "mistral": "api.mistral.ai", "ollama": "localhost"}
-LOCAL_PROVIDERS = {"ollama", "openai_compatible", "offline_scripted"}
 EV_TAG = re.compile(r"\[ev:([A-Za-z0-9._:\-]+)\]")
 
 
@@ -79,8 +81,10 @@ def coverage(bundle: EvidenceBundle) -> dict[str, str]:
 def _base(bundle: EvidenceBundle, backend: str, ttl: int, **kw) -> dict[str, Any]:
     now = utc_now()
     valid_until = max(bundle.as_of, now) + timedelta(seconds=ttl) if kw.pop("live", False) else bundle.as_of + timedelta(seconds=ttl)
+    cal_ok = any(h.source_kind == SourceKind.MACRO_CALENDAR and h.status == SourceHealthStatus.AVAILABLE for h in bundle.source_health)
     return dict(assessment_id=f"ctx-{uuid.uuid4().hex[:12]}", instrument=bundle.instruments[0], as_of=bundle.as_of, backend=backend,
                 bundle_id=bundle.bundle_id, bundle_hash=bundle.bundle_hash, coverage=coverage(bundle),
+                calendar_coverage_until=bundle.as_of + CALENDAR_LOOKAHEAD if cal_ok else None,
                 event_flags=event_flags_from_bundle(bundle), generated_at=now, valid_until=valid_until, **kw)
 
 
@@ -107,19 +111,78 @@ class OfflineFixtureBackend:
                                  usage=ContextUsage(llm_calls=0, cost_estimate_usd=0.0, cost_basis="no LLM call", latency_seconds=0.0))
 
 
-def _budget_ok(cfg: LocalConfig, queue, backend: str, provider: str | None) -> tuple[bool, str]:
+def is_free_local(provider: str | None, base_url: str | None) -> bool:
+    """Free only when no paid remote endpoint can be reached: offline scripted model, or an
+    Ollama/OpenAI-compatible server on loopback. A provider *name* alone never implies free (F04)."""
+    if provider == "offline_scripted":
+        return True
+    if provider in ("ollama", "openai_compatible"):
+        url = base_url or ("http://localhost:11434/v1" if provider == "ollama" else None)
+        return bool(url) and httpx.URL(url).host in ("localhost", "127.0.0.1", "::1")
+    return False
+
+
+def job_cost_estimate(cfg: LocalConfig, calls: int) -> float | None:
+    """Upper-bound reservation for a number of LLM calls from the explicit price table (None = no price table)."""
     llm = cfg.context.llm
-    u = queue.usage_today(backend) if queue is not None else {"calls": 0, "cost_usd": 0.0}
-    if u["calls"] >= cfg.context.max_calls_per_day:
-        return False, f"daily call cap {cfg.context.max_calls_per_day} reached"
-    if provider not in LOCAL_PROVIDERS:
-        if cfg.context.max_cost_usd_per_day <= 0:
-            return False, "max_cost_usd_per_day is 0: paid LLM calls are not permitted"
-        if llm.usd_per_1k_prompt_tokens is None or llm.usd_per_1k_completion_tokens is None:
-            return False, "no explicit price table: cost would be unknown, refusing paid call"
-        if u["cost_usd"] >= cfg.context.max_cost_usd_per_day:
-            return False, "daily cost cap reached"
+    if llm.usd_per_1k_prompt_tokens is None or llm.usd_per_1k_completion_tokens is None:
+        return None
+    per_call = (llm.max_prompt_tokens_per_call / 1000 * llm.usd_per_1k_prompt_tokens
+                + llm.max_output_tokens / 1000 * llm.usd_per_1k_completion_tokens)
+    return calls * per_call
+
+
+def _budget_ok(cfg: LocalConfig, queue, backend: str, provider: str | None, base_url: str | None = None,
+               calls: int = 1) -> tuple[bool, str]:
+    """Read-only pre-check (no reservation). Unknown-cost calls block further paid calls (F04)."""
+    if provider == "offline_scripted":
+        return True, ""
+    paid = not is_free_local(provider, base_url)
+    if queue is None:
+        return (False, "no usage ledger: budget cannot be enforced") if paid else (True, "")
+    u = queue.usage_today(backend)
+    if u["calls"] + calls > cfg.context.max_calls_per_day:
+        return False, f"daily call cap {cfg.context.max_calls_per_day} would be exceeded"
+    if not paid:
+        return True, ""
+    if u.get("cost_unknown_calls", 0) > 0:
+        return False, f"{u['cost_unknown_calls']} paid call(s) today have unknown cost; reconcile before further paid calls"
+    if cfg.context.max_cost_usd_per_day <= 0:
+        return False, "max_cost_usd_per_day is 0: paid LLM calls are not permitted"
+    est = job_cost_estimate(cfg, calls)
+    if est is None:
+        return False, "no explicit price table: cost would be unknown, refusing paid call"
+    if u["cost_usd"] + u.get("reserved_usd", 0.0) + est > cfg.context.max_cost_usd_per_day:
+        return False, "daily cost cap would be exceeded"
     return True, ""
+
+
+def reserve_budget(cfg: LocalConfig, queue, backend: str, provider: str | None, base_url: str | None,
+                   calls: int) -> tuple[bool, str, float, bool]:
+    """Atomically reserve the worst-case cost of a job. Returns (ok, reason, reserved_usd, paid)."""
+    if provider == "offline_scripted":
+        return True, "", 0.0, False
+    paid = not is_free_local(provider, base_url)
+    if queue is None:
+        return (False, "no usage ledger: budget cannot be enforced", 0.0, paid) if paid else (True, "", 0.0, False)
+    est = 0.0
+    if paid:
+        e = job_cost_estimate(cfg, calls)
+        if e is None:
+            return False, "no explicit price table: cost would be unknown, refusing paid call", 0.0, paid
+        est = e
+    ok, reason = queue.try_reserve(backend, est, cfg.context.max_cost_usd_per_day, cfg.context.max_calls_per_day, calls, paid)
+    return ok, reason, (est if ok else 0.0), paid
+
+
+def actual_cost(cfg: LocalConfig, prompt_tokens: int | None, completion_tokens: int | None, paid: bool) -> float | None:
+    if not paid:
+        return 0.0
+    llm = cfg.context.llm
+    if (prompt_tokens is None or completion_tokens is None
+            or llm.usd_per_1k_prompt_tokens is None or llm.usd_per_1k_completion_tokens is None):
+        return None
+    return prompt_tokens / 1000 * llm.usd_per_1k_prompt_tokens + completion_tokens / 1000 * llm.usd_per_1k_completion_tokens
 
 
 def _parse_claims(items: list[dict[str, Any]]) -> tuple[Claim, ...]:
@@ -155,11 +218,16 @@ class SimpleLLMBackend:
         if not llm.provider or not llm.model_id:
             return missing(bundle, self.name, ContextStatus.MISSING, "LLM provider/model not configured", self.cfg.context.ttl_seconds, **common)
         key = resolve_secret(llm.api_key_env)
-        if llm.provider not in LOCAL_PROVIDERS and not key:
+        if not is_free_local(llm.provider, llm.base_url) and not key:
             return missing(bundle, self.name, ContextStatus.MISSING, f"API key env {llm.api_key_env} not set", self.cfg.context.ttl_seconds, **common)
-        ok, why = _budget_ok(self.cfg, self.queue, self.name, llm.provider)
+        ok, why, reserved, paid = reserve_budget(self.cfg, self.queue, self.name, llm.provider, llm.base_url, calls=1)
         if not ok:
             return missing(bundle, self.name, ContextStatus.MISSING, why, self.cfg.context.ttl_seconds, **common)
+
+        def settle(cost: float | None) -> None:
+            if self.queue is not None:
+                self.queue.settle(self.name, reserved, cost, paid)
+
         user = self._evidence_text(bundle)
         t0 = time.time()
         try:
@@ -182,18 +250,18 @@ class SimpleLLMBackend:
                     d = r.json()
                     text = d["choices"][0]["message"]["content"]
                     resp_model, pt, ct = d.get("model"), d.get("usage", {}).get("prompt_tokens"), d.get("usage", {}).get("completion_tokens")
+        except httpx.ConnectError as exc:  # request never reached the provider: nothing billed
+            settle(0.0)
+            return missing(bundle, self.name, ContextStatus.MISSING, f"LLM endpoint unreachable: {type(exc).__name__}", self.cfg.context.ttl_seconds, **common)
         except httpx.TimeoutException:
+            settle(None)  # may have been billed: charge the reservation and flag unknown
             return missing(bundle, self.name, ContextStatus.TIMEOUT, "LLM call timed out", self.cfg.context.ttl_seconds, **common)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
+            settle(None)
             return missing(bundle, self.name, ContextStatus.MISSING, f"LLM call failed: {type(exc).__name__}", self.cfg.context.ttl_seconds, **common)
         latency = time.time() - t0
-        cost = None
-        if llm.provider in ("ollama", "offline_scripted"):
-            cost = 0.0
-        elif pt is not None and ct is not None and llm.usd_per_1k_prompt_tokens is not None and llm.usd_per_1k_completion_tokens is not None:
-            cost = pt / 1000 * llm.usd_per_1k_prompt_tokens + ct / 1000 * llm.usd_per_1k_completion_tokens
-        if self.queue is not None:
-            self.queue.add_usage(self.name, 1, cost)
+        cost = actual_cost(self.cfg, pt, ct, paid)
+        settle(cost)
         usage = ContextUsage(llm_calls=1, prompt_tokens=pt, completion_tokens=ct, cost_estimate_usd=cost,
                              cost_basis="price table x reported tokens" if cost is not None else "unknown", latency_seconds=latency)
         try:
@@ -238,12 +306,13 @@ class TradingAgentsBackend:
             return missing(bundle, self.name, ContextStatus.UNSUPPORTED, "TradingAgents worker venv not installed", self.cfg.context.ttl_seconds, **common)
         if not llm.provider:
             return missing(bundle, self.name, ContextStatus.MISSING, "LLM provider not configured for TradingAgents", self.cfg.context.ttl_seconds, **common)
-        if llm.provider != "offline_scripted":
-            if llm.provider not in LOCAL_PROVIDERS and not resolve_secret(llm.api_key_env):
-                return missing(bundle, self.name, ContextStatus.MISSING, f"API key env {llm.api_key_env} not set", self.cfg.context.ttl_seconds, **common)
-            ok, why = _budget_ok(self.cfg, self.queue, self.name, llm.provider)
-            if not ok:
-                return missing(bundle, self.name, ContextStatus.MISSING, why, self.cfg.context.ttl_seconds, **common)
+        if not is_free_local(llm.provider, llm.base_url) and not resolve_secret(llm.api_key_env):
+            return missing(bundle, self.name, ContextStatus.MISSING, f"API key env {llm.api_key_env} not set", self.cfg.context.ttl_seconds, **common)
+        max_calls = self.cfg.context.max_llm_calls_per_job
+        ok, why, reserved, paid = reserve_budget(self.cfg, self.queue, self.name, llm.provider, llm.base_url, calls=max_calls)
+        if not ok:
+            return missing(bundle, self.name, ContextStatus.MISSING, why, self.cfg.context.ttl_seconds, **common)
+        self._reservation = (reserved, paid, max_calls)
         work = Path(self.cfg.paths.data_root) / "context" / "ta_runs" / (job.get("job_id") or uuid.uuid4().hex[:12])
         work.mkdir(parents=True, exist_ok=True)
         allow = [] if llm.provider in ("offline_scripted",) else [LLM_HOSTS.get(llm.provider, "")]
@@ -253,8 +322,9 @@ class TradingAgentsBackend:
                    "instrument_label": f"{bundle.instruments[0].instrument_id} USDT-margined perpetual (Binance USDⓈ-M)",
                    "trade_date": bundle.as_of.strftime("%Y-%m-%d"), "selected_analysts": ta.selected_analysts,
                    "max_debate_rounds": ta.max_debate_rounds, "max_risk_discuss_rounds": ta.max_risk_discuss_rounds,
-                   "expected_sha": ta.upstream_sha, "allow_hosts": [h for h in allow if h],
-                   "llm": {"provider": llm.provider, "model_id": llm.model_id, "backend_url": llm.base_url, "temperature": llm.temperature}}
+                   "expected_sha": ta.upstream_sha, "allow_hosts": [h for h in allow if h], "max_llm_calls": max_calls,
+                   "llm": {"provider": llm.provider, "model_id": llm.model_id, "backend_url": llm.base_url, "temperature": llm.temperature,
+                           "max_tokens": llm.max_output_tokens}}
         inp, outp = work / "job.json", work / "result.json"
         inp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         bridge = Path(__file__).with_name("ta_bridge.py")
@@ -263,31 +333,49 @@ class TradingAgentsBackend:
             proc = subprocess.run([str(py), "-I", str(bridge), "--input", str(inp), "--output", str(outp)],
                                   capture_output=True, text=True, timeout=self.cfg.context.job_timeout_seconds, cwd=str(work))
         except subprocess.TimeoutExpired:
+            self._settle(None, None)
             return missing(bundle, self.name, ContextStatus.TIMEOUT, f"TradingAgents run exceeded {self.cfg.context.job_timeout_seconds}s", self.cfg.context.ttl_seconds, **common)
         latency = time.time() - t0
         if not outp.exists():
+            self._settle(None, None)
             return missing(bundle, self.name, ContextStatus.INVALID, f"bridge produced no result (rc={proc.returncode}): {proc.stderr[-400:]}", self.cfg.context.ttl_seconds, **common)
         res = json.loads(outp.read_text(encoding="utf-8"))
         return self.to_assessment(bundle, res, common, latency)
 
+    _reservation: tuple[float, bool, int] | None = None
+
+    def _settle(self, cost: float | None, actual_calls: int | None) -> None:
+        if self.queue is None or self._reservation is None:
+            return
+        reserved, paid, reserved_calls = self._reservation
+        self.queue.settle(self.name, reserved, cost, paid, reserved_calls=reserved_calls, actual_calls=actual_calls)
+        self._reservation = None
+
     def to_assessment(self, bundle: EvidenceBundle, res: dict[str, Any], common: dict[str, Any], latency: float) -> ContextAssessment:
         audit = res.get("audit", {})
         calls = int(audit.get("llm_calls") or 0)
-        cost = 0.0 if common.get("provider") in ("offline_scripted", "ollama") else None
-        if self.queue is not None and common.get("provider") != "offline_scripted":
-            self.queue.add_usage(self.name, max(calls, 1), cost)
-        usage = ContextUsage(llm_calls=calls, cost_estimate_usd=cost, cost_basis="no paid call" if cost == 0.0 else "unknown (token usage not reported by bridge)",
-                             latency_seconds=latency)
+        paid = not is_free_local(common.get("provider"), self.cfg.context.llm.base_url)
+        pt, ct = audit.get("prompt_tokens"), audit.get("completion_tokens")
+        cost = actual_cost(self.cfg, pt, ct, paid) if (audit.get("tokens_complete") or not paid) else None
+        self._settle(cost, calls)
+        if cost is None:
+            basis = "unknown (token usage incomplete): reservation charged"
+        else:
+            basis = "price table x reported tokens" if paid else "no paid call"
+        usage = ContextUsage(llm_calls=calls, prompt_tokens=pt, completion_tokens=ct, cost_estimate_usd=cost,
+                             cost_basis=basis, latency_seconds=latency)
         if res.get("status") != "OK":
             return ContextAssessment(**_base(bundle, self.name, self.cfg.context.ttl_seconds, **common), temporal_scope=TemporalScope.UNVERIFIED,
                                      status=ContextStatus.INVALID, status_reasons=(f"TradingAgents run failed: {res.get('error', '?')[:300]}",), usage=usage)
         bypass = [t for t in audit.get("tool_calls", []) if t.get("served_by") != "aqe_evidence"]
-        clean = not audit.get("network_denied") and not audit.get("guard_violations") and not bypass and res.get("memory_log_disabled")
+        clean = (not audit.get("network_denied") and not audit.get("guard_violations") and not bypass
+                 and res.get("memory_log_disabled") and not audit.get("proxy_env") and not audit.get("budget_abort"))
         scope = TemporalScope.INTRADAY_ASOF_VERIFIED if clean else TemporalScope.UNVERIFIED
         reasons = ["LLM parametric knowledge may post-date as_of; forward validation required",
                    f"upstream TradingAgents {res.get('upstream_version')} @ {res.get('upstream_commit')}"]
         if not clean:
-            reasons.append(f"isolation not proven: network_denied={audit.get('network_denied')[:5]}, violations={audit.get('guard_violations')}")
+            reasons.append(f"isolation not proven: network_denied={(audit.get('network_denied') or [])[:5]}, "
+                           f"violations={audit.get('guard_violations')}, proxy_env={audit.get('proxy_env')}, bypass={len(bypass)}")
         claims, counter = [], []
         for key, text in (res.get("reports") or {}).items():
             for line in str(text).splitlines():

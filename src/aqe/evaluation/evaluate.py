@@ -24,6 +24,7 @@ from aqe.datasets.build import load_dataset, rows_for_training, rows_in_window
 from aqe.ensemble.calibration import TemperatureCalibrator, ece, segment_predictions
 from aqe.ensemble.meta import REGIME_FEATURES, MetaModel, logloss
 from aqe.evaluation.costs import max_drawdown, trade_return
+from aqe.models.chain import calibration_chain_problems, component_problems
 from aqe.models.registry import artifact_dir, exp_dir, load_metadata, load_registry, save_metadata, set_readiness
 from aqe.storage import atomic_write_json, atomic_write_text
 from aqe.storage.bars import read_bars
@@ -137,12 +138,20 @@ def run_evaluate(exp: ExperimentConfig, cfg: LocalConfig, cfg_hash: str, rec: Ru
         cal = {c: TemperatureCalibrator.load(artifact_dir(cfg.paths.artifact_root, exp.experiment_id, reg[f"calib_{c}"]),
                                              load_metadata(cfg.paths.artifact_root, exp.experiment_id, reg[f"calib_{c}"]))
                for c in ("numeric_only", "lgbm_only", "tcn_only")}
+        # same lineage + point-in-time rules as online inference (models.chain, review F01/F02)
+        current = {"meta": reg["meta_numeric_only"], "lgbm": reg["lgbm"], "tcn": reg["tcn"]}
+        ident = dict(instrument_id=exp.instrument.instrument_id, horizon_seconds=h, feature_profile=man.feature_profile.value,
+                     feature_schema_hash=man.feature_schema_hash, feature_names=list(man.feature_names),
+                     as_of=pd.Timestamp(seg.test_start).to_pydatetime())
+        problems = []
+        for slot, kinds in (("lgbm", {"lgbm"}), ("tcn", {"tcn"}), ("meta_numeric_only", {"meta"})):
+            problems += component_problems(load_metadata(cfg.paths.artifact_root, exp.experiment_id, reg[slot]), expected_kinds=kinds, **ident)
         for c in ("numeric_only", "lgbm_only", "tcn_only"):
             cm = load_metadata(cfg.paths.artifact_root, exp.experiment_id, reg[f"calib_{c}"])
-            fitted = cm["fitted_on_artifacts"]
-            current = {"meta": reg["meta_numeric_only"], "lgbm": reg["lgbm"], "tcn": reg["tcn"]}
-            if any(current[k] != v for k, v in fitted.items()):
-                raise AssertionError(f"calibrator {c} was fitted on different base/meta artifacts; re-run calibrate")
+            problems += component_problems(cm, expected_kinds={"calibrator"}, **ident)
+            problems += calibration_chain_problems(cm, current, c, mm.base_kinds)
+        if problems:
+            raise AssertionError("artifact chain invalid for locked test; re-run calibrate: " + "; ".join(problems))
         regime = df.loc[rows]
         ok = np.isfinite(base["lgbm"]).all(1) & np.isfinite(base["tcn"]).all(1) & regime[REGIME_FEATURES].notna().all(1).to_numpy()
         y = df.loc[rows, f"y_{h}"].to_numpy()[ok].astype(int)
@@ -186,13 +195,15 @@ def run_evaluate(exp: ExperimentConfig, cfg: LocalConfig, cfg_hash: str, rec: Ru
         # readiness: evaluated on the locked OOS segment (a stage, not a quality claim)
         evidence = f"locked test {iso_utc(seg.test_start)}..{iso_utc(test_end)} run {rec.run_id} trial {trial_no}"
         for slot in ("lgbm", "tcn", "meta_numeric_only", "calib_numeric_only"):
-            set_readiness(cfg.paths.artifact_root, exp.experiment_id, reg[slot], ModelReadiness.OOS_EVALUATED, evidence)
+            set_readiness(cfg.paths.artifact_root, exp.experiment_id, reg[slot], ModelReadiness.OOS_EVALUATED, evidence,
+                          established_at=iso_utc(test_end))
         cm = load_metadata(cfg.paths.artifact_root, exp.experiment_id, reg["calib_numeric_only"])
         cm["calibration_validated"] = bool(cm.get("sample_sufficient")) and e3["ece"] <= MAX_TEST_ECE
         cm["calibration_validated_basis"] = f"test ECE {e3['ece']:.4f} (max {MAX_TEST_ECE}); sample_sufficient={cm.get('sample_sufficient')}"
         cm["oos_verdict"] = verdict
         vt = e3["virtual_trading"]["base_costs"]
-        cost_verdict = "NET_POSITIVE" if vt.get("trades", 0) >= 30 and vt.get("sum_net_return", 0) > 0 and             e3["virtual_trading"]["costs_x2"].get("sum_net_return", 0) > 0 else "NOT_POSITIVE"
+        cost_verdict = ("NET_POSITIVE" if vt.get("trades", 0) >= 30 and vt.get("sum_net_return", 0) > 0
+                        and e3["virtual_trading"]["costs_x2"].get("sum_net_return", 0) > 0 else "NOT_POSITIVE")
         cm["oos_cost_verdict"] = cost_verdict
         cm["oos_cost_basis"] = {"policy": {"min_edge": ev.policy_min_edge, "min_prob": ev.policy_min_prob}, "base": vt,
                                 "costs_x2_sum_net": e3["virtual_trading"]["costs_x2"].get("sum_net_return")}
@@ -223,7 +234,7 @@ def render_eval_md(r: dict[str, Any]) -> str:
     for h, hr in r["horizons"].items():
         L += [f"## 기간 {int(h)//3600}h", f"- 평가 행 {hr['rows_evaluated']} / {hr['rows_in_segment']} (coverage {hr['coverage']:.3f}), 비중첩 라벨 창 ≈ {hr['independent_label_windows']}",
               f"- E3 확률 품질 판정: **{hr['oos_verdict_E3']}** · 비용 차감 판정: **{hr.get('oos_cost_verdict_E3')}** · 보정 검증: {hr['calibration_validated']} · LGBM/TCN 손실 상관 {hr['error_corr_lgbm_tcn']:.3f}", "",
-              "| 실험 | logloss | Brier | acc | ECE | Δlogloss vs E0 (95% block CI) | 거래수 | 순수익합(기본비용) | 순수익합(비용×2) | 순수익합(+1봉 지연) | MDD(log) |",
+              "| 실험 | logloss | Brier | acc | ECE | Δlogloss vs E0 (95% block CI) | 거래수 | 거래별 순수익률 산술합(기본비용) | 산술합(비용×2) | 산술합(+1봉 지연) | MDD(log 단위) |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
         for name, m in hr["experiments"].items():
             if m.get("status") == "BLOCKED":
@@ -240,4 +251,7 @@ def render_eval_md(r: dict[str, Any]) -> str:
         L.append("- 레짐별 logloss(E3): " + ", ".join(f"{k}={v:.4f}" for k, v in e3["by_regime_logloss"].items()))
         L.append("")
     L.append("가상 운용은 사전 고정 정책(p_dir − p_opp ≥ edge, p_dir ≥ min_prob, 비중첩)으로 계산했으며 실제 수동 매매 성과를 대신하지 않는다.")
+    L.append("'산술합'은 거래별 명목 순수익률의 단순 합이며 계좌의 복리 누적 수익률이 아니다. MDD는 log 수익률 누적 기준이다.")
+    L.append("Δlogloss CI는 각 실험 대 E0(사전 빈도)의 비교다. E3(메타)와 E1(LGBM) 사이의 우열은 이 표로 검정되지 않았다.")
+    L.append("ECE 하나로 모든 클래스·레짐의 신뢰도를 보증하지 않는다(클래스별 reliability는 JSON의 per-class 지표 참고).")
     return "\n".join(L)

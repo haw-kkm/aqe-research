@@ -1,0 +1,88 @@
+[
+  {
+    "finding": "F01_future_meta_and_calibrator",
+    "as_of": "2026-03-02T00:00:00+00:00",
+    "supplied_train_cutoff": "2027-01-01T00:00:00Z",
+    "actual_status": "OK",
+    "probabilities": {
+      "p_down": 0.3333333333333333,
+      "p_neutral": 0.3333333333333333,
+      "p_up": 0.3333333333333333
+    },
+    "reasons": []
+  },
+  {
+    "finding": "F02_stale_calibration_chain",
+    "actual_status": "OK",
+    "fitted_on": {
+      "meta": "OLD-meta",
+      "lgbm": "OLD-lgbm",
+      "tcn": "OLD-tcn"
+    },
+    "actual_base_ids": {
+      "lgbm": "review-lgbm",
+      "tcn": "review-tcn",
+      "meta": "review-meta",
+      "calibrator": "review-calibrator"
+    },
+    "reasons": []
+  },
+  {
+    "finding": "F03_non_allowlisted_direct_ip",
+    "allow_hosts": [
+      "api.openai.com"
+    ],
+    "connected_to": "127.0.0.2 (loopback only)",
+    "outcome": "connected",
+    "denied": []
+  },
+  {
+    "finding": "F04_unknown_cost_allows_next_paid_job",
+    "daily_cap_usd": 0.01,
+    "usage": {
+      "day": "2026-11-11",
+      "backend": "tradingagents",
+      "calls": 1,
+      "cost_usd": 0.0,
+      "cost_unknown_calls": 1
+    },
+    "next_paid_job_allowed": true,
+    "reason": ""
+  },
+  {
+    "finding": "F05_missing_calendar_passes_event_risk",
+    "source_coverage": {
+      "MACRO_CALENDAR": "NOT_CONFIGURED",
+      "NEWS": "NOT_CONFIGURED"
+    },
+    "temporal_scope": "UNVERIFIED",
+    "rule_outcome": "PASS",
+    "disposition": "REVIEW_CANDIDATE"
+  },
+  {
+    "finding": "F06_prediction_cache_ignores_changed_input",
+    "changed_feature": 99.0,
+    "first": [
+      [
+        0.2,
+        0.3,
+        0.5
+      ]
+    ],
+    "second": [
+      [
+        0.2,
+        0.3,
+        0.5
+      ]
+    ],
+    "expected_if_recomputed": [
+      [
+        0.7,
+        0.2,
+        0.1
+      ]
+    ],
+    "recompute_calls": 0
+  }
+]

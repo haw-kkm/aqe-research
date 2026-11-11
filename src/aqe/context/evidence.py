@@ -122,6 +122,10 @@ def market_evidence(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> t
     return items, SourceHealth(source_kind=SourceKind.MARKET_FLOW, status=SourceHealthStatus.AVAILABLE, detail=f"{len(items)} items", last_available_at=wm)
 
 
+CALENDAR_LOOKBACK = timedelta(days=1)
+CALENDAR_LOOKAHEAD = timedelta(days=3)
+
+
 def calendar_events(cfg: LocalConfig, as_of: datetime) -> tuple[list[ScheduledEvent], SourceHealth]:
     d = cfg.paths.data_root / "imports" / "calendar"
     files = sorted(d.glob("*.csv")) if d.exists() else []
@@ -134,7 +138,7 @@ def calendar_events(cfg: LocalConfig, as_of: datetime) -> tuple[list[ScheduledEv
             df[c] = pd.to_datetime(df[c], utc=True)
     df = df[df["available_at"] <= pd.Timestamp(as_of)]
     df = df.sort_values(["event_id", "revision"]).groupby("event_id").tail(1)
-    win = (df["scheduled_time"] >= pd.Timestamp(as_of) - pd.Timedelta(days=1)) & (df["scheduled_time"] <= pd.Timestamp(as_of) + pd.Timedelta(days=3))
+    win = (df["scheduled_time"] >= pd.Timestamp(as_of - CALENDAR_LOOKBACK)) & (df["scheduled_time"] <= pd.Timestamp(as_of + CALENDAR_LOOKAHEAD))
     out = []
     for _, r in df[win].iterrows():
         actual_ok = "actual_available_at" in r and pd.notna(r.get("actual_available_at")) and r["actual_available_at"] <= pd.Timestamp(as_of)

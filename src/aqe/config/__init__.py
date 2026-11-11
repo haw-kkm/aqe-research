@@ -73,6 +73,7 @@ class LLMConfig(_Cfg):
     base_url: str | None = None
     temperature: float = 0.0
     max_output_tokens: int = 2000
+    max_prompt_tokens_per_call: int = 8000  # upper bound used only for pre-call cost reservation
     usd_per_1k_prompt_tokens: float | None = None  # explicit price table; None => cost unknown
     usd_per_1k_completion_tokens: float | None = None
 
@@ -93,6 +94,7 @@ class ContextConfig(_Cfg):
     max_attempts: int = 2
     concurrency: int = 1
     max_calls_per_day: int = 200
+    max_llm_calls_per_job: int = 40  # TradingAgents graph LLM calls per job; the bridge aborts beyond this
     max_cost_usd_per_day: float = 0.0  # 0 => no paid calls allowed
     evidence_root: str = "evidence"
     llm: LLMConfig = LLMConfig()

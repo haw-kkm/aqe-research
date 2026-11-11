@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS context_jobs (
 CREATE INDEX IF NOT EXISTS context_jobs_status_idx ON context_jobs (status, created_at);
 CREATE TABLE IF NOT EXISTS context_usage_daily (
   day TEXT NOT NULL, backend TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
-  cost_usd REAL NOT NULL DEFAULT 0, cost_unknown_calls INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, backend));
+  cost_usd REAL NOT NULL DEFAULT 0, cost_unknown_calls INTEGER NOT NULL DEFAULT 0,
+  reserved_usd REAL NOT NULL DEFAULT 0, PRIMARY KEY (day, backend));
 CREATE TABLE IF NOT EXISTS ingestion_health (
   source TEXT NOT NULL, instrument_id TEXT NOT NULL, observed_at TEXT NOT NULL, status TEXT NOT NULL,
   detail TEXT, clock_offset_ms REAL, PRIMARY KEY (source, instrument_id, observed_at));
@@ -59,6 +60,10 @@ def init_sqlite(path: Path) -> None:
     with connect(path) as c:
         c.executescript(SQLITE_SCHEMA)
         c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_001_init", iso_utc(utc_now())))
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(context_usage_daily)")}
+        if "reserved_usd" not in cols:  # additive migration (review F04)
+            c.execute("ALTER TABLE context_usage_daily ADD COLUMN reserved_usd REAL NOT NULL DEFAULT 0")
+            c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_002_budget_reservation", iso_utc(utc_now())))
 
 
 def init_db(cfg: LocalConfig, rec: RunRecord) -> int:
@@ -150,14 +155,62 @@ class JobQueue:
         with connect(self.path) as c:
             return {r["status"]: r["n"] for r in c.execute("SELECT status, count(*) n FROM context_jobs GROUP BY status")}
 
-    # --- budget (B08.3): unknown cost is never recorded as 0 ---
+    # --- budget (B08.3, review F04): reserve before a paid call, settle after -------------------
+    # Unknown cost is never recorded as 0: an unsettled/unknown call is charged at its reservation
+    # and blocks further paid calls for the day until a human reconciles it.
     def usage_today(self, backend: str) -> dict[str, Any]:
         day = utc_now().strftime("%Y-%m-%d")
         with connect(self.path) as c:
             r = c.execute("SELECT * FROM context_usage_daily WHERE day=? AND backend=?", (day, backend)).fetchone()
-            return dict(r) if r else {"day": day, "backend": backend, "calls": 0, "cost_usd": 0.0, "cost_unknown_calls": 0}
+            return dict(r) if r else {"day": day, "backend": backend, "calls": 0, "cost_usd": 0.0, "cost_unknown_calls": 0, "reserved_usd": 0.0}
+
+    def try_reserve(self, backend: str, estimate_usd: float, cap_usd: float | None, max_calls: int, calls: int,
+                    paid: bool) -> tuple[bool, str]:
+        """Atomically check limits and reserve `estimate_usd` (paid) / count calls. Returns (ok, reason)."""
+        day = utc_now().strftime("%Y-%m-%d")
+        with connect(self.path) as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("INSERT OR IGNORE INTO context_usage_daily (day, backend) VALUES (?, ?)", (day, backend))
+            u = dict(c.execute("SELECT * FROM context_usage_daily WHERE day=? AND backend=?", (day, backend)).fetchone())
+            reason = ""
+            if u["calls"] + calls > max_calls:
+                reason = f"daily call cap {max_calls} would be exceeded ({u['calls']} used, {calls} requested)"
+            elif paid and u["cost_unknown_calls"] > 0:
+                reason = f"{u['cost_unknown_calls']} paid call(s) today have unknown cost; reconcile before further paid calls"
+            elif paid and (cap_usd is None or cap_usd <= 0):
+                reason = "max_cost_usd_per_day is 0: paid LLM calls are not permitted"
+            elif paid and u["cost_usd"] + u["reserved_usd"] + estimate_usd > cap_usd:
+                reason = (f"daily cost cap {cap_usd} would be exceeded: spent {u['cost_usd']:.4f} + reserved "
+                          f"{u['reserved_usd']:.4f} + this job {estimate_usd:.4f}")
+            if reason:
+                c.execute("COMMIT")
+                return False, reason
+            c.execute("UPDATE context_usage_daily SET reserved_usd=reserved_usd+?, calls=calls+? WHERE day=? AND backend=?",
+                      (estimate_usd if paid else 0.0, calls, day, backend))
+            c.execute("COMMIT")
+            return True, ""
+
+    def settle(self, backend: str, reserved_usd: float, actual_usd: float | None, paid: bool,
+               reserved_calls: int = 0, actual_calls: int | None = None) -> None:
+        """Release the reservation and book the actual cost; unknown => charge the reservation and flag."""
+        day = utc_now().strftime("%Y-%m-%d")
+        extra_calls = max(0, (actual_calls or 0) - reserved_calls)
+        with connect(self.path) as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("INSERT OR IGNORE INTO context_usage_daily (day, backend) VALUES (?, ?)", (day, backend))
+            if not paid:
+                c.execute("UPDATE context_usage_daily SET calls=calls+? WHERE day=? AND backend=?", (extra_calls, day, backend))
+            elif actual_usd is None:
+                c.execute("UPDATE context_usage_daily SET reserved_usd=max(0, reserved_usd-?), cost_usd=cost_usd+?, "
+                          "cost_unknown_calls=cost_unknown_calls+1, calls=calls+? WHERE day=? AND backend=?",
+                          (reserved_usd, reserved_usd, extra_calls, day, backend))
+            else:
+                c.execute("UPDATE context_usage_daily SET reserved_usd=max(0, reserved_usd-?), cost_usd=cost_usd+?, "
+                          "calls=calls+? WHERE day=? AND backend=?", (reserved_usd, actual_usd, extra_calls, day, backend))
+            c.execute("COMMIT")
 
     def add_usage(self, backend: str, calls: int, cost_usd: float | None) -> None:
+        """Record usage that was not reserved (kept for compatibility; unknown cost is flagged, never 0)."""
         day = utc_now().strftime("%Y-%m-%d")
         with connect(self.path) as c:
             c.execute("INSERT OR IGNORE INTO context_usage_daily (day, backend) VALUES (?, ?)", (day, backend))

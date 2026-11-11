@@ -13,10 +13,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-from aqe.contracts.context import ContextAssessment, ContextStatus
+from aqe.contracts.context import ContextAssessment, ContextStatus, context_usable_for_decision
 from aqe.contracts.core import (
     READINESS_RANK,
     Disposition,
@@ -59,6 +60,8 @@ class RiskRuleset(BaseModel):
     }
     high_event_caps_at: Disposition = Disposition.RESEARCH_ONLY
     event_info_unknown_caps_at: Disposition = Disposition.RESEARCH_ONLY
+    # sources that must be AVAILABLE (and point-in-time verified) before event risk can PASS
+    event_required_sources: list[str] = ["MACRO_CALENDAR", "NEWS"]
     disagreement_exceeded_caps_at: Disposition = Disposition.RESEARCH_ONLY
     disagreement_unknown_caps_at: Disposition = Disposition.RESEARCH_ONLY
     ood_caps_at: Disposition = Disposition.RESEARCH_ONLY
@@ -120,6 +123,9 @@ def _r1_readiness(inp: RiskInputs, rs: RiskRuleset) -> RuleResult:
             return _rule(rid, 1, RuleOutcome.FAIL, f"artifact {meta.get('artifact_id')} horizon mismatch", Disposition.ABSTAIN)
         if meta.get("instrument_id") != snap.instrument.instrument_id:
             return _rule(rid, 1, RuleOutcome.FAIL, f"artifact {meta.get('artifact_id')} instrument mismatch", Disposition.ABSTAIN)
+        cutoff = meta.get("train_label_cutoff")
+        if not cutoff or pd.Timestamp(cutoff) > pd.Timestamp(snap.as_of):
+            return _rule(rid, 1, RuleOutcome.FAIL, f"artifact {meta.get('artifact_id')} ({meta.get('kind')}) label cutoff {cutoff} not before as_of", Disposition.ABSTAIN, "use artifacts trained only on labels matured before as_of")
     for p in inp.predictions:
         if p.key.instrument != snap.instrument or p.key.feature_profile != snap.feature_profile:
             return _rule(rid, 1, RuleOutcome.FAIL, f"prediction {p.prediction_id} identity mismatch", Disposition.ABSTAIN)
@@ -212,19 +218,25 @@ def _r4_event_liquidity_cost(inp: RiskInputs, rs: RiskRuleset) -> RuleResult:
     if rs.require_cost_adjusted_edge and inp.ensemble is not None and inp.ensemble.extra.get("oos_cost_verdict") != "NET_POSITIVE":
         return _rule(rid, 4, RuleOutcome.FAIL, f"locked-test virtual trading net of fees/slippage/funding: {inp.ensemble.extra.get('oos_cost_verdict') or 'not evaluated'}", Disposition.RESEARCH_ONLY, "show a positive cost-adjusted edge on a fresh locked segment / forward test")
     ctx = inp.context
-    if ctx is None or ctx.status not in (ContextStatus.OK, ContextStatus.PARTIAL):
-        why = "no context" if ctx is None else f"context {ctx.status.value}"
-        return _rule(rid, 4, RuleOutcome.UNKNOWN, f"event/calendar risk unknown ({why}); flow-based and news evidence absent", rs.event_info_unknown_caps_at, "provide calendar/news evidence via context worker")
     horizon_end = inp.snapshot.as_of + timedelta(seconds=inp.horizon_seconds) if inp.snapshot else None
-    high = []
-    for f in ctx.event_flags:
-        if f.severity.upper() != "HIGH":
-            continue
-        if f.window_start is None or horizon_end is None or f.window_start <= horizon_end:
-            high.append(f.name)
-    if high:
-        return _rule(rid, 4, RuleOutcome.FAIL, f"high-severity events within horizon: {high}", rs.high_event_caps_at, "re-evaluate after the event")
-    return _rule(rid, 4, RuleOutcome.PASS, "liquidity sufficient; cost assumptions present; no high-severity event flags")
+    # known HIGH events restrict even when the assessment is not usable for approval (conservative)
+    if ctx is not None and ctx.status in (ContextStatus.OK, ContextStatus.PARTIAL):
+        high = [f.name for f in ctx.event_flags if f.severity.upper() == "HIGH"
+                and (f.window_start is None or horizon_end is None or f.window_start <= horizon_end)]
+        if high:
+            return _rule(rid, 4, RuleOutcome.FAIL, f"high-severity events within horizon: {high}", rs.high_event_caps_at, "re-evaluate after the event")
+    unknown_cap, recover = rs.event_info_unknown_caps_at, "provide verified calendar/news evidence via the context worker"
+    if ctx is None or ctx.status not in (ContextStatus.OK, ContextStatus.PARTIAL):
+        why = "no context" if ctx is None else f"context {str(ctx.status)}"
+        return _rule(rid, 4, RuleOutcome.UNKNOWN, f"event/calendar risk unknown ({why}); flow-based and news evidence absent", unknown_cap, recover)
+    if not context_usable_for_decision(ctx):
+        return _rule(rid, 4, RuleOutcome.UNKNOWN, f"event risk unknown: context temporal scope {str(ctx.temporal_scope)} (not point-in-time verified)", unknown_cap, recover)
+    missing = {k: ctx.coverage.get(k, "MISSING") for k in rs.event_required_sources if ctx.coverage.get(k) != "AVAILABLE"}
+    if missing:
+        return _rule(rid, 4, RuleOutcome.UNKNOWN, f"event information incomplete (unknown is not 'no event'): {missing}", unknown_cap, recover)
+    if "MACRO_CALENDAR" in rs.event_required_sources and (ctx.calendar_coverage_until is None or horizon_end is None or ctx.calendar_coverage_until < horizon_end):
+        return _rule(rid, 4, RuleOutcome.UNKNOWN, f"verified calendar covers only until {ctx.calendar_coverage_until}; horizon ends {horizon_end}", unknown_cap, recover)
+    return _rule(rid, 4, RuleOutcome.PASS, "liquidity sufficient; cost assumptions present; verified calendar/news cover the horizon with no high-severity event")
 
 
 def _r5_portfolio(inp: RiskInputs, rs: RiskRuleset) -> RuleResult:

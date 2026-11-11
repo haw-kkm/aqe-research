@@ -20,8 +20,12 @@ are plain `aqe` commands; `deploy/windows/supervise.ps1` restarts them with expo
   (B05.4); decide retention explicitly before enabling any.
 - **Source lag**: `last_message_at` per stream in the collector status; a 30 s no-data watchdog reconnects.
 - **Order book**: `book_state` must be `SYNCED`; desync count rising means gaps (each forces a REST snapshot resync).
-- **LLM spend**: `context_usage_daily` (calls, cost_usd, cost_unknown_calls). Paid calls are refused when
-  `max_cost_usd_per_day` is 0 or no price table is configured.
+- **LLM spend**: `context_usage_daily` (calls, cost_usd, reserved_usd, cost_unknown_calls). Paid calls are refused when
+  `max_cost_usd_per_day` is 0, no price table is configured, no usage ledger exists, the reservation would exceed the
+  cap, or any paid call that day has unknown cost (ADR-0008).
+  Reconciling an unknown-cost day: check the provider's billing page, then record the confirmed amount, e.g.
+  `sqlite3 E:\aqe-v2\data\meta\aqe_meta.sqlite "UPDATE context_usage_daily SET cost_usd=<confirmed>, cost_unknown_calls=0 WHERE day='YYYY-MM-DD' AND backend='tradingagents'"`.
+  Never set it to 0 without a confirmed amount.
 - **Model/prompt versions**: every artifact has `metadata.json` (dataset manifest hash, config hash, code version,
   dependency versions, seed, readiness history); TradingAgents runs record upstream commit.
 

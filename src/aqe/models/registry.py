@@ -91,8 +91,12 @@ def update_registry(artifact_root: Path, experiment_id: str, horizon_seconds: in
     atomic_write_json(registry_path(artifact_root, experiment_id), reg)
 
 
-def set_readiness(artifact_root: Path, experiment_id: str, artifact_id: str, readiness: ModelReadiness, evidence: str) -> None:
+def set_readiness(artifact_root: Path, experiment_id: str, artifact_id: str, readiness: ModelReadiness, evidence: str,
+                  established_at: str | None = None) -> None:
+    """established_at = when the evidence became knowable (end of the evidence segment), used for
+    point-in-time replay (models.chain.readiness_at)."""
     meta = load_metadata(artifact_root, experiment_id, artifact_id)
     meta["readiness"] = readiness.value
-    meta.setdefault("readiness_history", []).append({"readiness": readiness.value, "evidence": evidence})
+    meta.setdefault("readiness_history", []).append({"readiness": readiness.value, "evidence": evidence,
+                                                     "established_at": established_at})
     save_metadata(artifact_root, experiment_id, meta)

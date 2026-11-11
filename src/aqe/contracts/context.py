@@ -201,6 +201,8 @@ class ContextAssessment(StrictModel):
     counterclaims: tuple[Claim, ...] = ()
     event_flags: tuple[EventFlag, ...] = ()
     coverage: dict[str, str] = Field(default_factory=dict)  # SourceKind -> SourceHealthStatus
+    # last time covered by a VERIFIED calendar snapshot (None = calendar not available / unknown)
+    calendar_coverage_until: UTCDateTime | None = None
     temporal_scope: TemporalScope
     contextual_rating: str | None = None  # raw upstream label (e.g. Buy/Hold/Sell); NOT a probability
     review_required: bool = False
@@ -218,6 +220,13 @@ class ContextAssessment(StrictModel):
         if self.valid_until <= self.as_of:
             raise ValueError("valid_until must be after as_of")
         return self
+
+
+def context_usable_for_decision(a: "ContextAssessment | None") -> bool:
+    """Context may feed combination/risk approval only if grounded AND point-in-time verified.
+    UNVERIFIED or DAILY_CONTEXT_ONLY assessments stay visible in reports but are not used (review F05)."""
+    return (a is not None and a.status in (ContextStatus.OK, ContextStatus.PARTIAL)
+            and a.temporal_scope == TemporalScope.INTRADAY_ASOF_VERIFIED)
 
 
 def validate_against_bundle(assessment: ContextAssessment, bundle: EvidenceBundle | None) -> ContextAssessment:

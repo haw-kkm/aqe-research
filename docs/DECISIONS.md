@@ -34,6 +34,24 @@
   `calibration_validated=true` only if the locked-test ECE ≤ 0.05 and the calibration segment had ≥100
   non-overlapping label windows.
 
+## ADR-0007 — Validation results have a knowledge time (review F01)
+- A locked-test verdict, `calibration_validated` and `OOS_EVALUATED` readiness are facts learned at the end of the
+  evidence segment (`readiness_history[].established_at`; legacy entries parsed from the evidence string).
+- Replay/online use them only for `as_of >= established_at`. Earlier as_of → readiness TRAINED_UNVALIDATED,
+  calibration not validated, positive verdicts `NOT_ESTABLISHED_AT_AS_OF`. Blocking verdicts (e.g. NOT_POSITIVE)
+  are applied to any as_of (stopping use on current knowledge is allowed; claiming past knowledge is not).
+
+## ADR-0008 — LLM budget: reserve, settle, block on unknown (review F04)
+- Before a paid job: atomically reserve calls × (max_prompt_tokens + max_output_tokens) × price table.
+- After: settle with the actual cost; if unknown (missing usage, timeout, failure after send) the reservation is
+  booked as cost and `cost_unknown_calls` blocks further paid calls that day until a human reconciles
+  (docs/OPERATIONS.md). `ollama`/`openai_compatible` count as free only on a loopback base URL.
+
+## ADR-0009 — Unknown event information is not 'no event' (review F05)
+- Event risk passes only with AVAILABLE `event_required_sources` (MACRO_CALENDAR, NEWS), an
+  INTRADAY_ASOF_VERIFIED assessment and a verified calendar window covering the horizon. Otherwise UNKNOWN
+  (caps at RESEARCH_ONLY). A verified empty calendar is a real PASS.
+
 ## ADR-0006 — No numeric_context meta yet
 - No historical, point-in-time structured context assessments exist (news receipt times are not recoverable,
   no LLM provider configured). A `numeric_context` meta/calibrator is therefore not trained; context is shown in

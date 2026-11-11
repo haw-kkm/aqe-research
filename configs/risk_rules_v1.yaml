@@ -13,6 +13,7 @@ required_sources:
   flow_v1: [bars, l2, trades]
 high_event_caps_at: RESEARCH_ONLY
 event_info_unknown_caps_at: RESEARCH_ONLY
+event_required_sources: [MACRO_CALENDAR, NEWS]   # unknown calendar/news != no event
 disagreement_exceeded_caps_at: RESEARCH_ONLY
 disagreement_unknown_caps_at: RESEARCH_ONLY
 ood_caps_at: RESEARCH_ONLY

@@ -88,14 +88,14 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
             artifact_root=cfg.paths.artifact_root, experiment_id=exp.experiment_id, snapshot=snapshot,
             feature_frame=ff, horizon_seconds=h, mode=mode, interval_seconds=interval, context=context,
         )
-        base_metas = [m for m in metas if m.get("kind") in ("lgbm", "tcn")]
+        used_metas = metas  # base + meta + calibrator: all checked by R1 (identity, label cutoff)
         if mode != RuntimeMode.REPLAY:
             # live decision instant: after the predictions were actually generated (B11: no retroactive use)
             decision_time = max(utc_now(), as_of)
         risk = evaluate_risk(RiskInputs(
             analysis_id=analysis_id, mode=mode, decision_time=decision_time, horizon_seconds=h, snapshot=snapshot,
             predictions=[p for p in preds if p.status.value == "OK"], ensemble=ens,
-            artifact_meta=[{**m, "instrument_id": m["instrument_id"]} for m in base_metas], context=context,
+            artifact_meta=used_metas, context=context,
             clock_skew_ms=clock_skew, source_quality={"bars": bar_quality}, quote_volume_24h=qv,
             cost_assumptions={"taker_fee_bps": exp.evaluation.taker_fee_bps, "slippage_bps": exp.evaluation.slippage_bps},
             portfolio=portfolio, last_price=last_price,

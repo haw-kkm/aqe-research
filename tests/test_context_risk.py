@@ -57,9 +57,15 @@ def _bundle(as_of, ids=("e1", "e2")):
                           bundle_hash=compute_bundle_hash((INST,), as_of, items, (), health))
 
 
-def _assessment(b, claims, status=ContextStatus.OK, rating=None, flags=()):
+FULL_COVERAGE = {"MARKET_FLOW": "AVAILABLE", "MACRO_CALENDAR": "AVAILABLE", "NEWS": "AVAILABLE"}
+
+
+def _assessment(b, claims, status=ContextStatus.OK, rating=None, flags=(), coverage=None, scope=TemporalScope.INTRADAY_ASOF_VERIFIED,
+                calendar_days=3):
     return ContextAssessment(assessment_id="a1", instrument=INST, as_of=b.as_of, backend="simple_llm", bundle_id=b.bundle_id,
-                             bundle_hash=b.bundle_hash, claims=claims, event_flags=flags, temporal_scope=TemporalScope.INTRADAY_ASOF_VERIFIED,
+                             bundle_hash=b.bundle_hash, claims=claims, event_flags=flags, temporal_scope=scope,
+                             coverage=dict(FULL_COVERAGE if coverage is None else coverage),
+                             calendar_coverage_until=b.as_of + timedelta(days=calendar_days) if calendar_days is not None else None,
                              contextual_rating=rating, status=status, generated_at=b.as_of + timedelta(seconds=30),
                              valid_until=b.as_of + timedelta(minutes=30))
 
@@ -97,27 +103,33 @@ def _llm_cfg(fixture_cfg, **llm):
     return cfg
 
 
-def test_simple_llm_missing_invalid_timeout(fixture_cfg, monkeypatch):
+def test_simple_llm_missing_invalid_timeout(fixture_cfg, monkeypatch, tmp_path):
+    from aqe.storage.metadb import JobQueue
+
     b = _bundle(utc(2026, 1, 1, 12))
     job = {"idempotency_key": "k"}
-    assert SimpleLLMBackend(fixture_cfg).assess(b, job).status == ContextStatus.MISSING  # not configured
+    q = lambda name: JobQueue(tmp_path / f"{name}.sqlite")  # noqa: E731 - fresh usage ledger per scenario
+    assert SimpleLLMBackend(fixture_cfg, q("a")).assess(b, job).status == ContextStatus.MISSING  # not configured
     cfg = _llm_cfg(fixture_cfg, provider="openai", model_id="m", api_key_env="AQE_TEST_KEY", usd_per_1k_prompt_tokens=0.001, usd_per_1k_completion_tokens=0.002)
-    assert SimpleLLMBackend(cfg).assess(b, job).status == ContextStatus.MISSING  # key absent
+    assert SimpleLLMBackend(cfg, q("b")).assess(b, job).status == ContextStatus.MISSING  # key absent
     monkeypatch.setenv("AQE_TEST_KEY", "sk-test")
     cfg0 = cfg.model_copy(deep=True)
     cfg0.context.max_cost_usd_per_day = 0.0
-    a = SimpleLLMBackend(cfg0).assess(b, job)
+    a = SimpleLLMBackend(cfg0, q("c")).assess(b, job)
     assert a.status == ContextStatus.MISSING and "not permitted" in a.status_reasons[0]  # cost cap 0
+    a = SimpleLLMBackend(cfg).assess(b, job)
+    assert a.status == ContextStatus.MISSING and "no usage ledger" in a.status_reasons[0]  # paid call without ledger refused
     not_json = httpx.MockTransport(lambda r: httpx.Response(200, json={"model": "m-x", "choices": [{"message": {"content": "not json"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}))
-    a = SimpleLLMBackend(cfg, transport=not_json).assess(b, job)
+    a = SimpleLLMBackend(cfg, q("d"), transport=not_json).assess(b, job)
     assert a.status == ContextStatus.INVALID and a.usage.cost_estimate_usd is not None
 
     def boom(r):
         raise httpx.ReadTimeout("slow", request=r)
 
-    assert SimpleLLMBackend(cfg, transport=httpx.MockTransport(boom)).assess(b, job).status == ContextStatus.TIMEOUT
+    assert SimpleLLMBackend(cfg, q("e"), transport=httpx.MockTransport(boom)).assess(b, job).status == ContextStatus.TIMEOUT
     ok = httpx.MockTransport(lambda r: httpx.Response(200, json={"model": "m-x", "choices": [{"message": {"content": '{"claims":[{"text":"t","kind":"OBSERVATION","direction":"NONE","evidence_ids":["ghost"]}],"counterclaims":[]}'}}], "usage": {}}))
-    a = validate_against_bundle(SimpleLLMBackend(cfg, transport=ok).assess(b, job), b)
+    qf = q("f")
+    a = validate_against_bundle(SimpleLLMBackend(cfg, qf, transport=ok).assess(b, job), b)
     assert a.status == ContextStatus.INVALID  # hallucinated id
     assert a.usage.cost_estimate_usd is None and a.usage.cost_basis == "unknown"  # unknown cost never recorded as 0
 
@@ -130,13 +142,14 @@ def test_network_guard_blocks_and_records():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     real_gai, real_connect = socket.getaddrinfo, socket.socket.connect
+    uninstall = mod.install_network_guard(set())
     try:
-        mod.install_network_guard(set())
         with pytest.raises(OSError):
             socket.getaddrinfo("query2.finance.yahoo.com", 443)
         assert "query2.finance.yahoo.com" in mod.AUDIT["network_denied"]
     finally:
-        socket.getaddrinfo, socket.socket.connect = real_gai, real_connect
+        uninstall()
+    assert socket.getaddrinfo is real_gai and socket.socket.connect is real_connect  # guard fully removed
 
 
 def test_bypass_or_network_attempt_marks_unverified(fixture_cfg):
@@ -249,7 +262,8 @@ def _ok_inputs(fixture_bars, **over):
                              disagreement_threshold=0.2, ood_status=OODStatus.IN_DISTRIBUTION, missingness={}, status=EnsembleStatus.OK,
                              readiness=ModelReadiness.OOS_EVALUATED, calibration_validated=True, generated_at=now,
                              ready_at=as_of + timedelta(seconds=5), valid_until=as_of + timedelta(minutes=5), extra={"oos_verdict": "SKILL_DEMONSTRATED", "oos_cost_verdict": "NET_POSITIVE"})
-    meta = [{"artifact_id": k, "feature_profile": "ohlcv_v0", "feature_schema_hash": snap.feature_schema_hash, "horizon_seconds": 3600, "instrument_id": "BTCUSDT"} for k in ("lgbm", "tcn")]
+    meta = [{"artifact_id": k, "kind": k, "feature_profile": "ohlcv_v0", "feature_schema_hash": snap.feature_schema_hash, "horizon_seconds": 3600,
+             "instrument_id": "BTCUSDT", "train_label_cutoff": "2025-01-01T00:00:00Z"} for k in ("lgbm", "tcn")]
     b = _bundle(as_of)
     ctx = _assessment(b, (Claim(text="c", kind="OBSERVATION", direction="NONE", evidence_ids=("e1",)),))
     pf = PortfolioSnapshot(snapshot_id="pf", as_of=as_of, equity_quote=100000, positions=(Position(instrument_id="BTCUSDT", market_type="usdm_perpetual", quantity_base=0.1),))

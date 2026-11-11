@@ -1,0 +1,94 @@
+[
+  {
+    "finding": "F01_future_meta_and_calibrator",
+    "as_of": "2026-03-02T00:00:00+00:00",
+    "supplied_train_cutoff": "2027-01-01T00:00:00Z",
+    "actual_status": "ABSTAIN",
+    "probabilities": null,
+    "reasons": [
+      "review-meta: trained on labels ending 2027-01-01T00:00:00Z after as_of 2026-03-02T00:00:00+00:00 (future leakage)",
+      "review-calibrator: trained on labels ending 2027-01-01T00:00:00Z after as_of 2026-03-02T00:00:00+00:00 (future leakage)"
+    ]
+  },
+  {
+    "finding": "F02_stale_calibration_chain",
+    "actual_status": "ABSTAIN",
+    "fitted_on": {
+      "meta": "OLD-meta",
+      "lgbm": "OLD-lgbm",
+      "tcn": "OLD-tcn"
+    },
+    "actual_base_ids": {
+      "lgbm": "review-lgbm",
+      "tcn": "review-tcn",
+      "meta": "review-meta",
+      "calibrator": "review-calibrator"
+    },
+    "reasons": [
+      "review-calibrator: fitted on lgbm=OLD-lgbm but current lgbm=review-lgbm",
+      "review-calibrator: fitted on meta=OLD-meta but current meta=review-meta",
+      "review-calibrator: fitted on tcn=OLD-tcn but current tcn=review-tcn"
+    ]
+  },
+  {
+    "finding": "F03_non_allowlisted_direct_ip",
+    "allow_hosts": [
+      "api.openai.com"
+    ],
+    "connected_to": "127.0.0.2 (loopback only)",
+    "outcome": "blocked: AQE network guard: destination '127.0.0.2' not allowed in evidence-gated run",
+    "denied": [
+      "127.0.0.2"
+    ]
+  },
+  {
+    "finding": "F04_unknown_cost_allows_next_paid_job",
+    "daily_cap_usd": 0.01,
+    "usage": {
+      "day": "2026-11-11",
+      "backend": "tradingagents",
+      "calls": 1,
+      "cost_usd": 0.0,
+      "cost_unknown_calls": 1,
+      "reserved_usd": 0.0
+    },
+    "next_paid_job_allowed": false,
+    "reason": "1 paid call(s) today have unknown cost; reconcile before further paid calls"
+  },
+  {
+    "finding": "F05_missing_calendar_passes_event_risk",
+    "source_coverage": {
+      "MACRO_CALENDAR": "NOT_CONFIGURED",
+      "NEWS": "NOT_CONFIGURED"
+    },
+    "temporal_scope": "UNVERIFIED",
+    "rule_outcome": "UNKNOWN",
+    "disposition": "RESEARCH_ONLY"
+  },
+  {
+    "finding": "F06_prediction_cache_ignores_changed_input",
+    "changed_feature": 99.0,
+    "first": [
+      [
+        0.2,
+        0.3,
+        0.5
+      ]
+    ],
+    "second": [
+      [
+        0.7,
+        0.2,
+        0.1
+      ]
+    ],
+    "expected_if_recomputed": [
+      [
+        0.7,
+        0.2,
+        0.1
+      ]
+    ],
+    "recompute_calls": 1
+  }
+]

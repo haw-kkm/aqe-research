@@ -21,6 +21,7 @@ from aqe.contracts.core import CLASS_ORDER, ModelReadiness, iso_utc, utc_now
 from aqe.datasets.build import load_dataset, manifest_hash, rows_in_window
 from aqe.ensemble.meta import MetaModel, logloss, softmax
 from aqe.ensemble.oos import load_predictor, predict_rows
+from aqe.models.chain import component_problems
 from aqe.models.registry import artifact_dir, exp_dir, load_metadata, load_registry, save_metadata, update_registry
 from aqe.storage.runs import EXIT_NOT_READY, EXIT_OK, RunRecord
 
@@ -74,25 +75,69 @@ def ece(p: np.ndarray, y: np.ndarray, bins: int = 10) -> float:
     return float(e)
 
 
+MODEL_FILES = ("model.txt", "model.pt", "normalizer.json")
+
+
+def model_files_hash(cfg: LocalConfig, exp: ExperimentConfig, aid: str) -> str:
+    """SHA-256 over the artifact's model files (a re-written model under the same id changes the key)."""
+    import hashlib
+
+    from aqe.storage import sha256_file
+
+    d = artifact_dir(cfg.paths.artifact_root, exp.experiment_id, aid)
+    parts = [f"{name}:{sha256_file(d / name)}" for name in MODEL_FILES if (d / name).exists()]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest() if parts else "no-model-files"
+
+
+def input_hash(df: pd.DataFrame, columns: list[str]) -> str:
+    """Content hash of every input column the predictor can see (TCN windows depend on earlier rows,
+    so the whole frame is hashed, not only the requested rows)."""
+    import hashlib
+
+    cols = [c for c in ["open_time", *columns] if c in df.columns]
+    hv = pd.util.hash_pandas_object(df[cols], index=False).to_numpy()
+    return hashlib.sha256(hv.tobytes() + "|".join(cols).encode()).hexdigest()
+
+
+def prediction_cache_key(aid: str, kind: str, model_hash: str, data_hash: str, features: list[str]) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps([aid, kind, model_hash, data_hash, list(features)]).encode()).hexdigest()
+
+
 def segment_predictions(cfg: LocalConfig, exp: ExperimentConfig, df: pd.DataFrame, h: int, rows: pd.Index,
                         reg: dict[str, str]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Predictions of the registered final base models (+ meta raw) for given rows; cached per artifact."""
-    cache_dir = exp_dir(cfg.paths.artifact_root, exp.experiment_id) / "pred_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    """Predictions of the registered final base models for given rows.
+
+    Cache identity (review F06): artifact id + model-file hash + content hash of the input frame +
+    feature list. Different input data or model files => a different cache entry => recomputation.
+    Legacy caches (`pred_cache/<artifact>.parquet`, keyed only by open_time) are never read."""
+    from aqe.storage import atomic_write_json
+
+    base_dir = exp_dir(cfg.paths.artifact_root, exp.experiment_id) / "pred_cache"
     out, metas = {}, {}
     for kind in ("lgbm", "tcn"):
         aid = reg.get(kind)
         if not aid:
             continue
-        cpath = cache_dir / f"{aid}.parquet"
+        meta, pred = load_predictor(cfg, exp, aid)
+        features = list(meta.get("feature_names") or [c for c in df.columns if c != "open_time"])
+        mhash, dhash = model_files_hash(cfg, exp, aid), input_hash(df, features)
+        key = prediction_cache_key(aid, kind, mhash, dhash, features)
+        cdir = base_dir / aid
+        cdir.mkdir(parents=True, exist_ok=True)
+        cpath = cdir / f"{key[:24]}.parquet"
         cached = pd.read_parquet(cpath) if cpath.exists() else None
         need = rows if cached is None else rows[~df.loc[rows, "open_time"].isin(cached["open_time"])]
-        meta, pred = load_predictor(cfg, exp, aid)
         if len(need):
             p = predict_rows(kind, pred, df, need)
             new = pd.DataFrame({"open_time": df.loc[need, "open_time"].to_numpy(), "p_down": p[:, 0], "p_neutral": p[:, 1], "p_up": p[:, 2]})
             cached = new if cached is None else pd.concat([cached, new], ignore_index=True).drop_duplicates("open_time", keep="last")
             cached.to_parquet(cpath, index=False)
+            atomic_write_json(cpath.with_suffix(".key.json"), {"cache_key": key, "artifact_id": aid, "kind": kind,
+                                                               "model_files_sha256": mhash, "input_sha256": dhash,
+                                                               "features": features})
         m = df.loc[rows, ["open_time"]].merge(cached, on="open_time", how="left")
         out[kind] = m[["p_down", "p_neutral", "p_up"]].to_numpy("float64")
         metas[kind] = meta
@@ -112,6 +157,14 @@ def run_calibrate(exp: ExperimentConfig, cfg: LocalConfig, cfg_hash: str, rec: R
             return EXIT_NOT_READY
         mmeta = load_metadata(cfg.paths.artifact_root, exp.experiment_id, meta_id)
         mm = MetaModel.load(artifact_dir(cfg.paths.artifact_root, exp.experiment_id, meta_id), mmeta)
+        ident = dict(instrument_id=exp.instrument.instrument_id, horizon_seconds=h, feature_profile=man.feature_profile.value,
+                     feature_schema_hash=man.feature_schema_hash, feature_names=list(man.feature_names),
+                     as_of=pd.Timestamp(seg.calibration_start).to_pydatetime())
+        problems = component_problems(mmeta, expected_kinds={"meta"}, **ident)
+        for k in mm.base_kinds:
+            problems += component_problems(load_metadata(cfg.paths.artifact_root, exp.experiment_id, reg[k]), expected_kinds={k}, **ident)
+        if problems:
+            raise AssertionError("cannot calibrate: " + "; ".join(problems))
         rows = rows_in_window(df, h, seg.calibration_start, seg.test_start, label_end_max=label_max).index
         base, bmetas = segment_predictions(cfg, exp, df, h, rows, reg)
         for k, bm in bmetas.items():

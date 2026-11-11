@@ -39,26 +39,128 @@ class GuardViolation(RuntimeError):
     pass
 
 
-def install_network_guard(allow_hosts: set[str]) -> None:
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+def install_network_guard(allow_hosts: set[str]):
+    """Deny-by-default egress for the evidence-gated run (review F03).
+
+    * DNS: only allow-listed host names resolve; their resolved IPs are remembered.
+    * TCP connect / connect_ex / sendto / Windows proactor ConnectEx: the destination must be an
+      allow-listed host name or an IP that an allow-listed name resolved to. Direct IP literals that
+      were not obtained this way are denied and recorded, also when the allow list is non-empty.
+    * Loopback is allowed only if a loopback name is itself allow-listed (e.g. local Ollama) —
+      except the internal self-pipe created by socket.socketpair() (asyncio on Windows).
+    Proxies are not trusted: if proxy env vars are set the run is recorded as not proven isolated.
+    """
+    import ipaddress
+    import threading
+
+    allow = {h.lower() for h in allow_hosts if h}
+    allow_loopback = bool(allow & LOOPBACK_NAMES)
+    allowed_ips: set[str] = set()
+    local = threading.local()
     real_getaddrinfo = socket.getaddrinfo
     real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+    real_socketpair = socket.socketpair
 
-    def guarded_getaddrinfo(host, *a, **k):
-        h = host.decode() if isinstance(host, bytes) else str(host)
-        if h not in allow_hosts and h not in ("localhost", "127.0.0.1", "::1"):
-            AUDIT["network_denied"].append(h)
-            raise OSError(f"AQE network guard: host '{h}' not allowed in evidence-gated run")
-        return real_getaddrinfo(host, *a, **k)
+    def deny(target: str):
+        AUDIT["network_denied"].append(target)
+        raise OSError(f"AQE network guard: destination '{target}' not allowed in evidence-gated run")
+
+    def is_loopback_ip(h: str) -> bool:
+        try:
+            return ipaddress.ip_address(h.split("%")[0]).is_loopback
+        except ValueError:
+            return False
+
+    def check(address) -> None:
+        if getattr(local, "socketpair", False):
+            return
+        if not isinstance(address, tuple):  # AF_UNIX path: local IPC, treated like loopback
+            if allow_loopback:
+                return
+            deny(str(address))
+        host = str(address[0]).lower()
+        try:
+            ipaddress.ip_address(host.split("%")[0])
+            is_ip = True
+        except ValueError:
+            is_ip = False
+        if is_ip:
+            if host in allowed_ips or (allow_loopback and is_loopback_ip(host)):
+                return
+            deny(host)
+        if host in allow:
+            return
+        deny(host)
+
+    def guarded_getaddrinfo(host, port, *a, **k):
+        h = (host.decode() if isinstance(host, bytes) else str(host or "")).lower()
+        if getattr(local, "socketpair", False) or h in allow or (allow_loopback and is_loopback_ip(h)):
+            res = real_getaddrinfo(host, port, *a, **k)
+            if h in allow:
+                allowed_ips.update(str(r[4][0]).lower() for r in res)
+            return res
+        deny(h)
 
     def guarded_connect(self, address):
-        host = address[0] if isinstance(address, tuple) else str(address)
-        if allow_hosts or host in ("127.0.0.1", "::1", "localhost"):
-            return real_connect(self, address)
-        AUDIT["network_denied"].append(str(host))
-        raise OSError(f"AQE network guard: connect to {host} denied")
+        check(address)
+        return real_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        check(address)
+        return real_connect_ex(self, address)
+
+    def guarded_sendto(self, data, *args):
+        check(args[-1])
+        return real_sendto(self, data, *args)
+
+    def guarded_socketpair(*a, **k):
+        local.socketpair = True
+        try:
+            return real_socketpair(*a, **k)
+        finally:
+            local.socketpair = False
 
     socket.getaddrinfo = guarded_getaddrinfo
     socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    socket.socket.sendto = guarded_sendto
+    socket.socketpair = guarded_socketpair
+    real_pc = None
+    try:  # asyncio on Windows connects through IOCP ConnectEx, not socket.connect
+        import asyncio.windows_events as _we
+
+        real_pc = _we.IocpProactor.connect
+
+        def guarded_proactor_connect(self, conn, address):
+            check(address)
+            return real_pc(self, conn, address)
+
+        _we.IocpProactor.connect = guarded_proactor_connect
+    except (ImportError, AttributeError):
+        pass
+    AUDIT["proxy_env"] = sorted({k.upper() for k in PROXY_ENV if os.environ.get(k)})
+
+    def uninstall() -> None:
+        socket.getaddrinfo = real_getaddrinfo
+        socket.socket.connect = real_connect
+        socket.socket.connect_ex = real_connect_ex
+        socket.socket.sendto = real_sendto
+        socket.socketpair = real_socketpair
+        try:
+            import asyncio.windows_events as _we2
+
+            if real_pc is not None:
+                _we2.IocpProactor.connect = real_pc
+        except (ImportError, AttributeError):
+            pass
+
+    return uninstall
 
 
 def bundle_text(bundle: dict, kinds: set[str], empty_note: str) -> tuple[str, list[str]]:
@@ -113,6 +215,51 @@ def daily_ohlcv_frame(bundle: dict):
     from tradingagents.dataflows.errors import NoMarketDataError
 
     raise NoMarketDataError("BTC-USD", "BTC-USD", "no daily OHLCV evidence in AQE bundle")
+
+
+def usage_handler(max_calls: int):
+    """LangChain callback: counts real LLM calls/tokens and aborts the run beyond max_calls (F04)."""
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    class UsageHandler(BaseCallbackHandler):
+        raise_error = True  # make the abort propagate instead of being swallowed
+
+        def __init__(self):
+            self.calls = 0
+            self.calls_with_usage = 0
+            self.prompt_tokens = 0
+            self.completion_tokens = 0
+
+        def _start(self):
+            self.calls += 1
+            if self.calls > max_calls:
+                AUDIT["budget_abort"] = f"LLM call {self.calls} exceeds max_llm_calls={max_calls}"
+                raise RuntimeError(AUDIT["budget_abort"])
+
+        def on_llm_start(self, *a, **k):
+            self._start()
+
+        def on_chat_model_start(self, *a, **k):
+            self._start()
+
+        def on_llm_end(self, response, **k):
+            pt = ct = None
+            tu = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
+            if tu:
+                pt, ct = tu.get("prompt_tokens"), tu.get("completion_tokens")
+            if pt is None:
+                for gens in getattr(response, "generations", []) or []:
+                    for g in gens:
+                        um = getattr(getattr(g, "message", None), "usage_metadata", None) or {}
+                        if um:
+                            pt = (pt or 0) + int(um.get("input_tokens", 0))
+                            ct = (ct or 0) + int(um.get("output_tokens", 0))
+            if pt is not None and ct is not None:
+                self.calls_with_usage += 1
+                self.prompt_tokens += int(pt)
+                self.completion_tokens += int(ct)
+
+    return UsageHandler()
 
 
 def scripted_model(bundle: dict):
@@ -176,6 +323,7 @@ def main() -> int:
     os.environ["TRADINGAGENTS_RESULTS_DIR"] = str(work / "results")
     os.environ["TRADINGAGENTS_CACHE_DIR"] = str(work / "cache")
     os.chdir(work)
+    handler = None
     install_network_guard(set(job.get("allow_hosts", [])))
     try:
         import importlib.metadata as md
@@ -212,6 +360,8 @@ def main() -> int:
                 cfg["backend_url"] = llm["backend_url"]
             if llm.get("temperature") is not None:
                 cfg["temperature"] = llm["temperature"]
+            if llm.get("max_tokens"):
+                cfg["max_tokens"] = int(llm["max_tokens"])  # existing upstream key: bounds output tokens per call
         snapshot.load_ohlcv = lambda symbol, as_of_date, fill_gaps=True: daily_ohlcv_frame(bundle)
 
         def _no_social(*a, **k):
@@ -236,7 +386,11 @@ def main() -> int:
                     return model
 
             trading_graph.create_tier_client = lambda config, tier, **k: _Client()
-        g = trading_graph.TradingAgentsGraph(selected_analysts=tuple(job.get("selected_analysts", ["market", "news"])), config=cfg)
+        handler = None
+        if llm.get("provider") != "offline_scripted":
+            handler = usage_handler(int(job.get("max_llm_calls", 40)))
+        g = trading_graph.TradingAgentsGraph(selected_analysts=tuple(job.get("selected_analysts", ["market", "news"])), config=cfg,
+                                             callbacks=[handler] if handler else None)
         if g.memory_log._log_path is not None:
             raise GuardViolation("memory log path not disabled")
         state, rating = g.propagate(job["company_name"], job["trade_date"], asset_type="crypto")
@@ -250,6 +404,14 @@ def main() -> int:
                    cited_ids=sorted(set(EV_TAG.findall("\n".join(reports.values())))))
     except Exception as exc:  # noqa: BLE001
         out.update(status="ERROR", error=f"{type(exc).__name__}: {exc}", trace=traceback.format_exc(limit=6))
+    try:
+        if handler is not None:
+            AUDIT["llm_calls"] = handler.calls
+            AUDIT["prompt_tokens"] = handler.prompt_tokens
+            AUDIT["completion_tokens"] = handler.completion_tokens
+            AUDIT["tokens_complete"] = handler.calls > 0 and handler.calls_with_usage == handler.calls
+    except NameError:
+        pass
     out["audit"] = AUDIT
     out["duration_seconds"] = round(time.time() - t0, 3)
     Path(a.output).write_text(json.dumps(out, ensure_ascii=False, default=str), encoding="utf-8")

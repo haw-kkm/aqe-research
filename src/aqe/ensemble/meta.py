@@ -123,6 +123,14 @@ def run_train_meta(exp: ExperimentConfig, cfg: LocalConfig, cfg_hash: str, rec: 
         if not kinds:
             rec.notes.append(f"h={h}: no OOS predictions; run build-oos")
             return EXIT_NOT_READY
+        stale = []
+        for k in kinds:
+            om = json.loads(oos_path(cfg, exp, k, h).with_suffix(".manifest.json").read_text(encoding="utf-8"))
+            if om.get("dataset_manifest_hash") != manifest_hash(man):
+                stale.append(f"{k}: OOS built from dataset {om.get('dataset_id')} (manifest hash differs from current dataset)")
+        if stale:
+            rec.notes.append(f"h={h}: OOS inputs do not match the current dataset; re-run build-oos: " + "; ".join(stale))
+            return EXIT_NOT_READY
         rows = load_meta_rows(cfg, exp, h, df, kinds, boundary)
         if rows["label_end_at"].max() > boundary:
             raise AssertionError("meta rows leak past calibration_start")
