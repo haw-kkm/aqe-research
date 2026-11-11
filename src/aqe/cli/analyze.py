@@ -79,8 +79,9 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
     debate_summary = None
     if context is not None and context.backend == "aqe_debate":
         from aqe.context.debate import debate_summary as _ds
+        from aqe.storage.metadb import sqlite_path
 
-        debate_summary = _ds(cfg.paths.data_root, inst, context.assessment_id, as_of)
+        debate_summary = _ds(cfg.paths.data_root, sqlite_path(cfg), inst, context.assessment_id, as_of)
     portfolio = None
     if cfg.analysis.portfolio_snapshot is not None and cfg.analysis.portfolio_snapshot.exists():
         portfolio = PortfolioSnapshot.model_validate(read_json(cfg.analysis.portfolio_snapshot))

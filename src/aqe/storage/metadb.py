@@ -7,6 +7,7 @@ SQLite store implements the job-queue/registry tables with the same names and se
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -37,6 +38,30 @@ CREATE TABLE IF NOT EXISTS ingestion_health (
 CREATE TABLE IF NOT EXISTS experiment_runs (
   run_id TEXT PRIMARY KEY, experiment_id TEXT, command TEXT NOT NULL, config_hash TEXT NOT NULL,
   status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, finished_at TEXT, body TEXT NOT NULL);
+-- hypothesis ledger (ADR-0013): authoritative, append-only; a batch is committed whole or not at all, in the same
+-- transaction as the job completion and the result outbox entry
+CREATE TABLE IF NOT EXISTS hypothesis_ledger (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT NOT NULL UNIQUE, batch_id TEXT NOT NULL,
+  instrument_slug TEXT NOT NULL, hypothesis_id TEXT NOT NULL, as_of TEXT NOT NULL, record_json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS hypothesis_ledger_inst_idx ON hypothesis_ledger (instrument_slug, seq);
+CREATE TABLE IF NOT EXISTS hypothesis_batches (
+  batch_id TEXT PRIMARY KEY, instrument_slug TEXT NOT NULL, job_id TEXT UNIQUE, debate_id TEXT NOT NULL,
+  assessment_id TEXT, as_of TEXT NOT NULL, base_version TEXT NOT NULL, row_count INTEGER NOT NULL,
+  rows_sha256 TEXT NOT NULL, committed_at TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS hypothesis_ledger_no_update BEFORE UPDATE ON hypothesis_ledger
+  BEGIN SELECT RAISE(ABORT, 'hypothesis_ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hypothesis_ledger_no_delete BEFORE DELETE ON hypothesis_ledger
+  BEGIN SELECT RAISE(ABORT, 'hypothesis_ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hypothesis_batches_no_update BEFORE UPDATE ON hypothesis_batches
+  BEGIN SELECT RAISE(ABORT, 'hypothesis_batches is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hypothesis_batches_no_delete BEFORE DELETE ON hypothesis_batches
+  BEGIN SELECT RAISE(ABORT, 'hypothesis_batches is append-only'); END;
+-- result outbox (ADR-0013): the final assessment (+ audit files) is stored with the job completion; files are
+-- written afterwards and re-written by the next worker run until materialized_at is set (no LLM re-run)
+CREATE TABLE IF NOT EXISTS context_outbox (
+  assessment_id TEXT PRIMARY KEY, job_id TEXT, assessment_json TEXT NOT NULL, files_json TEXT NOT NULL DEFAULT '[]',
+  committed_at TEXT NOT NULL, materialized_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+CREATE INDEX IF NOT EXISTS context_outbox_pending_idx ON context_outbox (materialized_at, committed_at);
 """
 
 
@@ -61,6 +86,7 @@ def init_sqlite(path: Path) -> None:
     with connect(path) as c:
         c.executescript(SQLITE_SCHEMA)
         c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_001_init", iso_utc(utc_now())))
+        c.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)", ("sqlite_004_hypothesis_ledger_outbox", iso_utc(utc_now())))
         cols = {r["name"] for r in c.execute("PRAGMA table_info(context_usage_daily)")}
         if "reserved_usd" not in cols:  # additive migration (review F04)
             c.execute("ALTER TABLE context_usage_daily ADD COLUMN reserved_usd REAL NOT NULL DEFAULT 0")
@@ -140,12 +166,12 @@ class JobQueue:
                             (assessment_id, iso_utc(utc_now()), job_id, owner))
             return cur.rowcount == 1
 
-    def complete_with(self, job_id: str, owner: str, assessment_id: str, on_commit: Callable[[], Any]) -> tuple[bool, Any]:
-        """Two-phase completion: under the queue's write lock, verify that `owner` still holds the lease, run
-        `on_commit` (a side effect such as a hypothesis-ledger append), then mark the job DONE — one transaction.
-        A worker that lost its lease gets (False, None) and `on_commit` never runs. If `on_commit` raises, the job
-        is not completed (still LEASED by `owner`) and the exception propagates. While the lock is held no other
-        worker can lease the job, so the lease cannot be lost between the check and the side effect."""
+    def complete_with(self, job_id: str, owner: str, assessment_id: str, on_commit: Callable[[sqlite3.Connection], Any]) -> tuple[bool, Any]:
+        """Atomic completion: in ONE transaction of this database, verify that `owner` still holds the lease, run
+        `on_commit(conn)` (its writes — hypothesis-ledger batch, result outbox — use the same connection), then mark
+        the job DONE. A worker that lost its lease gets (False, None) and `on_commit` never runs. If anything raises,
+        everything rolls back (no partial ledger batch, no outbox entry, job still LEASED by `owner`) and the exception
+        propagates. Files are never written inside this transaction (see the outbox, ADR-0013)."""
         with connect(self.path) as c:
             c.execute("BEGIN IMMEDIATE")
             try:
@@ -154,7 +180,7 @@ class JobQueue:
                 if held is None:
                     c.execute("ROLLBACK")
                     return False, None
-                out = on_commit()
+                out = on_commit(c)
                 c.execute("UPDATE context_jobs SET status='DONE', result_assessment_id=?, updated_at=?, lease_owner=NULL, "
                           "lease_expires_at=NULL WHERE job_id=?", (assessment_id, iso_utc(utc_now()), job_id))
                 c.execute("COMMIT")
@@ -163,6 +189,32 @@ class JobQueue:
                 if c.in_transaction:
                     c.execute("ROLLBACK")
                 raise
+
+    # --- result outbox (ADR-0013) ----------------------------------------------------------------
+    @staticmethod
+    def outbox_put(c: sqlite3.Connection, assessment: Any, job_id: str | None, files: list[dict[str, Any]] | tuple = ()) -> None:
+        """Inside a completion transaction: store the final assessment (+ files as {relpath, json}) for materialization."""
+        c.execute("INSERT INTO context_outbox (assessment_id, job_id, assessment_json, files_json, committed_at) VALUES (?,?,?,?,?)",
+                  (assessment.assessment_id, job_id, assessment.model_dump_json(), json.dumps(list(files), ensure_ascii=False),
+                   iso_utc(utc_now())))
+
+    def outbox_pending(self, ids: list[str] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with connect(self.path) as c:
+            if ids:
+                q = f"SELECT * FROM context_outbox WHERE materialized_at IS NULL AND assessment_id IN ({','.join('?' * len(ids))})"
+                rows = c.execute(q, tuple(ids)).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM context_outbox WHERE materialized_at IS NULL ORDER BY committed_at LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def outbox_mark(self, assessment_id: str, error: str | None) -> None:
+        """error=None: files written (materialized). Otherwise record the failure; the entry stays pending."""
+        with connect(self.path) as c:
+            if error is None:
+                c.execute("UPDATE context_outbox SET materialized_at=?, attempts=attempts+1, last_error=NULL "
+                          "WHERE assessment_id=? AND materialized_at IS NULL", (iso_utc(utc_now()), assessment_id))
+            else:
+                c.execute("UPDATE context_outbox SET attempts=attempts+1, last_error=? WHERE assessment_id=?", (error[:1000], assessment_id))
 
     def fail(self, job_id: str, owner: str, error: str, terminal_status: str = "FAILED") -> str | None:
         with connect(self.path) as c:

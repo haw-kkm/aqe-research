@@ -16,7 +16,7 @@ import pandas as pd
 from aqe.config import LocalConfig, config_hash
 from aqe.context.backends import context_cache_key, make_backend, missing, prompt_hash
 from aqe.context.evidence import build_bundle
-from aqe.context.store import assessments_dir, load_bundle, save_assessment, save_bundle
+from aqe.context.store import assessments_dir, load_bundle, materialize_outbox, save_bundle
 from aqe.contracts.context import ContextStatus, validate_against_bundle
 from aqe.contracts.core import RuntimeMode, iso_utc, utc_now
 from aqe.storage.bars import read_bars
@@ -54,9 +54,13 @@ def enqueue_for_asof(cfg: LocalConfig, rec: RunRecord, as_of: datetime | None, r
 
 
 def process_one(cfg: LocalConfig, queue: JobQueue, backend, owner: str) -> dict | None:
+    """Lease one job, assess, commit (lease check + side effects + result outbox + DONE in one transaction), then
+    write the result files from the outbox. Results committed earlier whose files are still missing are written
+    first (recovery without re-running the backend). Returns None only when there was nothing to do."""
+    recovered, _ = materialize_outbox(cfg.paths.data_root, queue)
     job = queue.lease(owner)
     if job is None:
-        return None
+        return {"recovered": recovered} if recovered else None
     bundle = load_bundle(cfg.paths.data_root, job["bundle_id"])
     if bundle is None:
         queue.fail(job["job_id"], owner, "bundle missing", terminal_status="FAILED")
@@ -69,19 +73,25 @@ def process_one(cfg: LocalConfig, queue: JobQueue, backend, owner: str) -> dict 
     staging = assessments_dir(cfg.paths.data_root, bundle.instruments[0]).parent / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
     commit = getattr(backend, "commit", None)  # two-phase backends (aqe_debate): side effects only while the lease is held
-    if commit is not None:
-        try:
+    try:
+        if commit is not None:
             held, a = commit(a, job, owner, queue)
-        except Exception as exc:  # noqa: BLE001 - nothing completed; the job is retried or failed, never half-done
-            queue.fail(job["job_id"], owner, f"commit error {type(exc).__name__}: {exc}")
-            return {"job_id": job["job_id"], "result": f"commit failed: {type(exc).__name__}: {exc}"[:300]}
+        else:
+            held, _ = queue.complete_with(job["job_id"], owner, a.assessment_id, lambda c: queue.outbox_put(c, a, job["job_id"]))
+    except Exception as exc:  # noqa: BLE001 - the transaction rolled back: nothing committed, job retried or failed
+        queue.fail(job["job_id"], owner, f"commit error {type(exc).__name__}: {exc}")
+        return {"job_id": job["job_id"], "result": f"commit failed: {type(exc).__name__}: {exc}"[:300]}
+    if not held:
+        return {"job_id": job["job_id"], "result": "lease lost; result discarded (no double completion)"}
+    out = {"job_id": job["job_id"], "assessment_id": a.assessment_id, "status": a.status.value, "temporal_scope": a.temporal_scope.value}
+    _, errors = materialize_outbox(cfg.paths.data_root, queue, ids=[a.assessment_id])
+    if errors:  # committed (job DONE, ledger applied); files are written from the outbox by the next worker run
+        out["result"] = f"committed; result files pending ({errors[a.assessment_id]}) — written by the next worker run"
     else:
-        held = queue.complete(job["job_id"], owner, a.assessment_id)
-    if held:
-        p = save_assessment(cfg.paths.data_root, a)
-        return {"job_id": job["job_id"], "assessment_id": a.assessment_id, "status": a.status.value,
-                "temporal_scope": a.temporal_scope.value, "path": str(p)}
-    return {"job_id": job["job_id"], "result": "lease lost; result discarded (no double completion)"}
+        out["path"] = str(assessments_dir(cfg.paths.data_root, bundle.instruments[0]) / f"{a.assessment_id}.json")
+    if recovered:
+        out["recovered"] = recovered
+    return out
 
 
 def run_worker(cfg: LocalConfig, rec: RunRecord, once: bool = False, max_jobs: int | None = None) -> int:

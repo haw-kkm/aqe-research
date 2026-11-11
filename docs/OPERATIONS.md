@@ -7,7 +7,7 @@ are plain `aqe` commands; `deploy/windows/supervise.ps1` restarts them with expo
 | Process | Command | Health / state files |
 |---|---|---|
 | Public-data collector | `deploy\windows\supervise.ps1 -Command collect` | `{data_root}/status/collector_BTCUSDT.json` (connections, book state, last message per stream, desyncs, aggTrade gaps, clock offset, disk free), `collector_BTCUSDT.checkpoint.json` |
-| Context worker (LLM) | `deploy\windows\supervise.ps1 -Command context-worker` | SQLite `{data_root}/meta/aqe_meta.sqlite` tables `context_jobs`, `context_usage_daily` |
+| Context worker (LLM) | `deploy\windows\supervise.ps1 -Command context-worker` | SQLite `{data_root}/meta/aqe_meta.sqlite` tables `context_jobs`, `context_usage_daily`, `hypothesis_ledger`/`hypothesis_batches` (append-only), `context_outbox` (results with `materialized_at IS NULL` are re-written by the next worker run; ADR-0013) |
 | Shadow analysis | `deploy\windows\shadow_loop.ps1 -Config configs\shadow.yaml` | `{data_root}/reports/analysis-*.json/.md`, `{data_root}/runs/` |
 | Environment check | `aqe doctor --config configs/local.yaml` | `{data_root}/status/doctor_latest.json` |
 

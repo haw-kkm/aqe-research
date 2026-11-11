@@ -8,6 +8,8 @@ These are wiring/contract tests — not evidence of analysis quality.
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -19,12 +21,12 @@ from aqe.context.debate import (
     DebateBackend,
     activation,
     active_priors,
+    LedgerIntegrityError,
     apply_to_ledger,
     build_prompts,
     check_debate,
-    commit_ledger,
+    commit_plan,
     debate_summary,
-    ledger_path,
     load_debate,
     load_ledger,
     plan_ledger,
@@ -32,8 +34,9 @@ from aqe.context.debate import (
     prompts_hash,
     role_slice,
     states_at,
+    verify_ledger,
 )
-from aqe.context.store import save_bundle
+from aqe.context.store import assessments_dir, save_bundle
 from aqe.context.worker import process_one
 from aqe.contracts.context import (
     ContextStatus,
@@ -57,7 +60,7 @@ from aqe.contracts.debate import (
     SynthesisReport,
 )
 from aqe.risk.engine import evaluate_risk
-from aqe.storage.metadb import JobQueue, connect
+from aqe.storage.metadb import JobQueue, connect, sqlite_path
 from tests.conftest import ROOT, utc
 from tests.test_context_risk import _ok_inputs, _rs
 
@@ -111,9 +114,15 @@ WORKER_PY = ROOT / ".venv-ta" / "Scripts" / "python.exe"
 needs_worker = pytest.mark.skipif(not WORKER_PY.exists(), reason=".venv-ta not installed")
 
 
+def DB(data_root):  # noqa: N802 - the queue database = hypothesis ledger + result outbox (ADR-0013)
+    return Path(data_root) / "meta" / "aqe_meta.sqlite"
+
+
 def _cfg(fixture_cfg, data_root, **debate):
     cfg = fixture_cfg.model_copy(deep=True)
     cfg.paths.data_root = data_root
+    cfg.database.sqlite_relpath = "meta/aqe_meta.sqlite"
+    assert sqlite_path(cfg) == DB(data_root)
     cfg.context.backend = "aqe_debate"
     cfg.context.llm.provider = "offline_scripted"
     cfg.context.llm.model_id = "aqe-offline-scripted-debate"
@@ -127,7 +136,7 @@ def _cfg(fixture_cfg, data_root, **debate):
 def _finish(be, when, debate_id, synth=None, records=None, job=None):
     """Candidate assessment from a finished (scripted) worker result; `records` = ledger read BEFORE the LLM run."""
     b = make_bundle(when)
-    recs = load_ledger(be.cfg.paths.data_root, INST) if records is None else records
+    recs = load_ledger(be.db, INST) if records is None else records
     st, notes = activation(b, [r.value for r in AnalystRole])
     return be.finish(b, result(synth=synth), debate_id, ACTIVE, st, notes, H, active_priors(recs, when), recs,
                      {"provider": "offline_scripted", "model_id": "t"}, 0.0, "ph", job=job)
@@ -212,11 +221,11 @@ def test_synthesis_checks(synth, expect):
 # ------------------------------------------------------------------ hypothesis ledger (§7)
 def _apply(tmp_path, as_of, synth_dict, prior=()):
     b = make_bundle(as_of)
-    records = load_ledger(tmp_path, INST)
+    records = load_ledger(DB(tmp_path), INST)
     priors = active_priors(records, as_of)
     c = check_debate(result(synth=synth_dict), b, ACTIVE, H, priors)
     assert c["synthesis"] is not None, c["failures"]
-    rows, applied, note, id_map = apply_to_ledger(tmp_path, INST, f"debate-{as_of.hour:02d}{as_of.minute:02d}", as_of, c["synthesis"], records)
+    rows, applied, note, id_map = apply_to_ledger(DB(tmp_path), INST, f"debate-{as_of.hour:02d}{as_of.minute:02d}", as_of, c["synthesis"], records)
     return rows, applied, note, id_map
 
 
@@ -225,19 +234,18 @@ def test_ledger_lifecycle_keep_revise_invalidate_expire_append_only(tmp_path):
     rows, applied, _, ids = _apply(tmp_path, t0, synthesis())
     assert applied and {r.state for r in rows} == {HypothesisState.ACTIVE}
     p1h, p24 = ids["p3600"], ids["p86400"]
-    lines_before = ledger_path(tmp_path, INST).read_text(encoding="utf-8").splitlines()
+    before = load_ledger(DB(tmp_path), INST)
     t1 = t0 + timedelta(minutes=30)
     dec = [{"hypothesis_id": p24, "decision": "KEEP", "reason": "still consistent", "evidence_ids": ["mkt-bars-1"]},
            {"hypothesis_id": p1h, "decision": "INVALIDATE", "reason": "range broke", "evidence_ids": ["mkt-daily-1"]},
            {"hypothesis_id": ids["o3600"], "decision": "REVISE", "reason": "refined", "evidence_ids": ["mkt-bars-1"], "replacement_id": "p3600"}]
     rows2, applied2, _, ids2 = _apply(tmp_path, t1, synthesis(prior_decisions=dec))
-    st = states_at(load_ledger(tmp_path, INST), t1)
+    st = states_at(load_ledger(DB(tmp_path), INST), t1)
     assert st[p1h].state == HypothesisState.INVALIDATED and st[p1h].evidence_ids == ("mkt-daily-1",)
     assert st[p24].state == HypothesisState.ACTIVE and st[p24].valid_until == t1 + timedelta(hours=24)
     assert st[ids["o3600"]].state == HypothesisState.REVISED
     assert st[ids2["p3600"]].previous_id == ids["o3600"]  # lineage kept
-    lines_after = ledger_path(tmp_path, INST).read_text(encoding="utf-8").splitlines()
-    assert lines_after[: len(lines_before)] == lines_before  # nothing overwritten
+    assert load_ledger(DB(tmp_path), INST)[: len(before)] == before  # nothing overwritten (UPDATE/DELETE: see test_r01_*)
     # time passes beyond 1h validity without re-confirmation -> EXPIRED by code (not by the LLM)
     t2 = t1 + timedelta(hours=2)
     rows3, _, _, _ = _apply(tmp_path, t2, synthesis())
@@ -247,7 +255,7 @@ def test_ledger_lifecycle_keep_revise_invalidate_expire_append_only(tmp_path):
 
 def test_invalidate_requires_evidence_and_known_prior(tmp_path):
     _, _, _, ids = _apply(tmp_path, AS_OF, synthesis())
-    priors = active_priors(load_ledger(tmp_path, INST), AS_OF + timedelta(minutes=5))
+    priors = active_priors(load_ledger(DB(tmp_path), INST), AS_OF + timedelta(minutes=5))
     b = make_bundle(AS_OF + timedelta(minutes=5))
     no_ev = synthesis(prior_decisions=[{"hypothesis_id": ids["p3600"], "decision": "INVALIDATE", "reason": "felt like it", "evidence_ids": []}])
     assert check_debate(result(synth=no_ev), b, ACTIVE, H, priors)["status"] == "INVALID"
@@ -264,7 +272,7 @@ def test_late_arriving_debate_is_not_applied(tmp_path):
 # ------------------------------------------------------------------ projection & risk independence
 def test_projection_keeps_numeric_and_risk_unchanged(fixture_bars, tmp_path):
     c = check_debate(result(), make_bundle(), ACTIVE, H, [])
-    _, _, _, ids = apply_to_ledger(tmp_path, INST, "debate-x", AS_OF, c["synthesis"], [])
+    _, _, _, ids = apply_to_ledger(DB(tmp_path), INST, "debate-x", AS_OF, c["synthesis"], [])
     claims, counter, review = project(c, ids)
     assert any(cl.kind.value == "OBSERVATION" for cl in claims) and any(cl.direction.value == "UP" for cl in counter)
     assert all(cl.falsifier for cl in claims if cl.kind.value == "INFERENCE")
@@ -281,7 +289,7 @@ def test_projection_keeps_numeric_and_risk_unchanged(fixture_bars, tmp_path):
 
 
 def test_job_coalescing_supersedes_older_pending(tmp_path):
-    q = JobQueue(tmp_path / "q.sqlite")
+    q = JobQueue(DB(tmp_path))
     a = q.enqueue("k1", "BTCUSDT", AS_OF, "b1", "aqe_debate")
     b = q.enqueue("k2", "BTCUSDT", AS_OF + timedelta(minutes=5), "b2", "aqe_debate")
     assert q.supersede_pending("BTCUSDT", "aqe_debate", AS_OF + timedelta(minutes=5), b["job_id"]) == 1
@@ -290,7 +298,7 @@ def test_job_coalescing_supersedes_older_pending(tmp_path):
 
 # ------------------------------------------------------------------ integration: real LangGraph worker, scripted LLM
 def _backend(fixture_cfg, tmp_path, **opts):
-    return DebateBackend(_cfg(fixture_cfg, tmp_path, **opts), JobQueue(tmp_path / "q.sqlite"), project_root=ROOT, horizons=H)
+    return DebateBackend(_cfg(fixture_cfg, tmp_path, **opts), JobQueue(DB(tmp_path)), project_root=ROOT, horizons=H)
 
 
 @needs_worker
@@ -299,7 +307,7 @@ def test_worker_graph_end_to_end_with_revision_and_format_fix(fixture_cfg, tmp_p
     be = _backend(fixture_cfg, tmp_path)
     b = make_bundle()
     a = be.assess(b, {"job_id": "j1", "idempotency_key": "k1", "scripted_options": {"revise_role": "FLOW", "bad_synthesis_first": True}})
-    assert load_ledger(tmp_path, INST) == []  # assess only plans; the ledger changes at commit
+    assert load_ledger(DB(tmp_path), INST) == []  # assess only plans; the ledger changes at commit
     held, a = be.commit(a)
     assert held and any(r == "hypothesis ledger: applied" for r in a.status_reasons)
     assert a.backend == "aqe_debate" and a.status == ContextStatus.PARTIAL  # NEWS/CROSS_MARKET not activated
@@ -311,9 +319,9 @@ def test_worker_graph_end_to_end_with_revision_and_format_fix(fixture_cfg, tmp_p
     # 2 drafts + critic + 1 revision + synthesis + 1 format-only repair = 6 <= 8
     assert rec["llm_calls"] == 6 and rec["max_llm_calls"] == 8 and rec["status"] in ("OK", "PARTIAL")
     assert rec["applied_to_ledger"] is True
-    states = states_at(load_ledger(tmp_path, INST), b.as_of)
+    states = states_at(load_ledger(DB(tmp_path), INST), b.as_of)
     assert sum(1 for r in states.values() if r.state == HypothesisState.ACTIVE) == 4  # primary + opposing per horizon
-    summary = debate_summary(tmp_path, INST, a.assessment_id, b.as_of)
+    summary = debate_summary(tmp_path, DB(tmp_path), INST, a.assessment_id, b.as_of)
     assert summary["horizons"][0]["primary"]["canonical_id"] and summary["revision_role"] == "FLOW"
     from aqe.reporting.report import render_debate
 
@@ -351,7 +359,7 @@ def test_worker_queue_path_commits_with_the_job(fixture_cfg, tmp_path):
     r = process_one(be.cfg, be.queue, be, "worker-1")
     assert r["status"] == "PARTIAL" and be.queue.get(job["job_id"])["status"] == "DONE"
     assert be.queue.get(job["job_id"])["result_assessment_id"] == r["assessment_id"]
-    ledger = load_ledger(tmp_path, INST)
+    ledger = load_ledger(DB(tmp_path), INST)
     assert len(ledger) == 4 and {x.job_id for x in ledger} == {job["job_id"]}
     saved = json.loads(Path(r["path"]).read_text(encoding="utf-8"))
     assert "hypothesis ledger: applied" in saved["status_reasons"]
@@ -369,7 +377,7 @@ def test_worker_hallucinated_ids_fail_role(fixture_cfg, tmp_path):
 # ------------------------------------------------------------------ review 2026-11-12 regressions (D01–D05)
 def test_states_at_orders_by_as_of_not_file_position(tmp_path):
     _, _, _, ids = _apply(tmp_path, AS_OF, synthesis())
-    recs = load_ledger(tmp_path, INST)
+    recs = load_ledger(DB(tmp_path), INST)
     r0 = next(r for r in recs if r.hypothesis_id == ids["p3600"])
     newer = r0.model_copy(update={"record_id": "hr-new", "state": HypothesisState.INVALIDATED, "as_of": AS_OF + timedelta(minutes=10)})
     older = r0.model_copy(update={"record_id": "hr-old", "state": HypothesisState.ACTIVE, "as_of": AS_OF + timedelta(minutes=5)})
@@ -382,18 +390,18 @@ def test_states_at_orders_by_as_of_not_file_position(tmp_path):
 def test_d01_inflight_debate_cannot_reactivate_newer_invalidation(fixture_cfg, tmp_path, old_min, new_min, expect):
     be = DebateBackend(_cfg(fixture_cfg, tmp_path), project_root=ROOT, horizons=H)
     assert be.commit(_finish(be, AS_OF, "debate-base"))[0]
-    captured = load_ledger(tmp_path, INST)  # the old run reads the ledger, then its LLM run is slow
+    captured = load_ledger(DB(tmp_path), INST)  # the old run reads the ledger, then its LLM run is slow
     t_old, t_new = AS_OF + timedelta(minutes=old_min), AS_OF + timedelta(minutes=new_min)
     prior = next(r for r in active_priors(captured, t_old) if r.horizon_seconds == 3600 and r.position == "primary")
     keep = [{"hypothesis_id": prior.hypothesis_id, "decision": "KEEP", "reason": "old snapshot", "evidence_ids": ["mkt-bars-1"]}]
     old = _finish(be, t_old, "debate-old", synthesis(prior_decisions=keep), records=captured)
     inv = [{"hypothesis_id": prior.hypothesis_id, "decision": "INVALIDATE", "reason": "range broke", "evidence_ids": ["mkt-bars-1"]}]
     assert be.commit(_finish(be, t_new, "debate-new", synthesis(prior_decisions=inv)))[0]
-    lines = ledger_path(tmp_path, INST).read_text(encoding="utf-8").splitlines()
+    before = load_ledger(DB(tmp_path), INST)
     held, old_final = be.commit(old)  # the old run finishes last
     assert held
-    assert ledger_path(tmp_path, INST).read_text(encoding="utf-8").splitlines() == lines  # nothing appended
-    ledger = load_ledger(tmp_path, INST)
+    ledger = load_ledger(DB(tmp_path), INST)
+    assert ledger == before  # nothing appended
     assert not any(r.debate_id == "debate-old" for r in ledger)
     assert states_at(ledger, t_new)[prior.hypothesis_id].state == HypothesisState.INVALIDATED
     rec = load_debate(tmp_path, INST, old.assessment_id)  # kept as an audit record, marked not applied
@@ -406,7 +414,7 @@ def test_d02_worker_that_lost_its_lease_never_writes_the_ledger(fixture_cfg, tmp
     cfg = _cfg(fixture_cfg, tmp_path)
     b = make_bundle()
     save_bundle(tmp_path, b)
-    q = JobQueue(tmp_path / "q.sqlite")
+    q = JobQueue(DB(tmp_path))
     job = q.enqueue("k-lease", "BTCUSDT", AS_OF, b.bundle_id, "aqe_debate")
     taken = {}
 
@@ -419,7 +427,7 @@ def test_d02_worker_that_lost_its_lease_never_writes_the_ledger(fixture_cfg, tmp
 
     r = process_one(cfg, q, SlowDebate(cfg, q, project_root=ROOT, horizons=H), "old-owner")
     assert r["result"].startswith("lease lost")
-    assert load_ledger(tmp_path, INST) == []  # no side effect from the rejected worker
+    assert load_ledger(DB(tmp_path), INST) == []  # no side effect from the rejected worker
     assert q.get(job["job_id"])["status"] == "LEASED" and q.get(job["job_id"])["lease_owner"] == "replacement-owner"
     stale = [load_debate(tmp_path, INST, p.name.split(".")[0]) for p in (tmp_path / "context" / "debates" / INST.slug()).glob("*.debate.json")]
     assert len(stale) == 1 and stale[0].applied_to_ledger is False and "lease lost" in stale[0].ledger_note
@@ -428,24 +436,27 @@ def test_d02_worker_that_lost_its_lease_never_writes_the_ledger(fixture_cfg, tmp
     a = validate_against_bundle(_finish(owner, AS_OF, "debate-owner", job=taken["job"]), b)
     held, a = owner.commit(a, taken["job"], "replacement-owner", q)
     assert held and q.get(job["job_id"])["status"] == "DONE" and q.get(job["job_id"])["result_assessment_id"] == a.assessment_id
-    ledger = load_ledger(tmp_path, INST)
+    ledger = load_ledger(DB(tmp_path), INST)
     assert len(ledger) == 4 and {x.debate_id for x in ledger} == {"debate-owner"} and {x.job_id for x in ledger} == {job["job_id"]}
 
 
 def test_d02_complete_with_checks_lease_and_rolls_back(tmp_path):
-    q = JobQueue(tmp_path / "q.sqlite")
+    q = JobQueue(DB(tmp_path))
     j = q.enqueue("k", "BTCUSDT", AS_OF, "b", "aqe_debate")
     q.lease("w1")
     ran = []
-    assert q.complete_with(j["job_id"], "w2", "a0", lambda: ran.append("w2")) == (False, None) and ran == []
+    assert q.complete_with(j["job_id"], "w2", "a0", lambda c: ran.append("w2")) == (False, None) and ran == []
 
-    def boom():
+    def boom(c):  # writes on the transaction, then fails: the write must not survive
+        c.execute("INSERT INTO context_outbox (assessment_id, job_id, assessment_json, committed_at) VALUES ('a1', ?, '{}', 'x')",
+                  (j["job_id"],))
         raise OSError("disk full")
 
     with pytest.raises(OSError):
         q.complete_with(j["job_id"], "w1", "a1", boom)
     assert q.get(j["job_id"])["status"] == "LEASED" and q.get(j["job_id"])["lease_owner"] == "w1"  # not completed
-    assert q.complete_with(j["job_id"], "w1", "a2", lambda: "ok") == (True, "ok")
+    assert q.outbox_pending() == []  # rolled back together
+    assert q.complete_with(j["job_id"], "w1", "a2", lambda c: "ok") == (True, "ok")
     assert q.get(j["job_id"])["status"] == "DONE" and q.get(j["job_id"])["result_assessment_id"] == "a2"
 
 
@@ -453,7 +464,7 @@ def test_d02_commit_error_leaves_job_retryable_and_ledger_untouched(fixture_cfg,
     cfg = _cfg(fixture_cfg, tmp_path)
     b = make_bundle()
     save_bundle(tmp_path, b)
-    q = JobQueue(tmp_path / "q.sqlite", max_attempts=2)
+    q = JobQueue(DB(tmp_path), max_attempts=2)
     job = q.enqueue("k-err", "BTCUSDT", AS_OF, b.bundle_id, "aqe_debate")
 
     class Scripted(DebateBackend):
@@ -466,21 +477,21 @@ def test_d02_commit_error_leaves_job_retryable_and_ledger_untouched(fixture_cfg,
     monkeypatch.setattr("aqe.context.debate.commit_ledger", broken)
     r = process_one(cfg, q, Scripted(cfg, q, project_root=ROOT, horizons=H), "w1")
     assert r["result"].startswith("commit failed") and q.get(job["job_id"])["status"] == "PENDING"
-    assert load_ledger(tmp_path, INST) == []
+    assert load_ledger(DB(tmp_path), INST) == []
 
 
-def test_d02_retried_job_is_not_applied_twice(tmp_path):
+def test_d02_same_job_is_never_applied_twice(tmp_path):
     c = check_debate(result(), make_bundle(), ACTIVE, H, [])
-    assert commit_ledger(tmp_path, plan_ledger(INST, "debate-try1", AS_OF, c["synthesis"], [], job_id="job-1")) == (True, "applied")
-    recs = load_ledger(tmp_path, INST)  # crash after the append, before the queue commit: the job runs again
-    applied, note = commit_ledger(tmp_path, plan_ledger(INST, "debate-try2", AS_OF, c["synthesis"], recs, job_id="job-1"))
-    assert not applied and "already applied" in note and len(load_ledger(tmp_path, INST)) == len(recs)
+    assert commit_plan(DB(tmp_path), plan_ledger(INST, "debate-try1", AS_OF, c["synthesis"], [], job_id="job-1")) == (True, "applied")
+    recs = load_ledger(DB(tmp_path), INST)  # a second plan for the same job, even on the current ledger, is refused
+    applied, note = commit_plan(DB(tmp_path), plan_ledger(INST, "debate-try2", AS_OF, c["synthesis"], recs, job_id="job-1"))
+    assert not applied and "already applied" in note and len(load_ledger(DB(tmp_path), INST)) == len(recs)
 
 
 def test_d03_revise_requires_same_instrument_and_horizon(tmp_path):
     _, _, _, ids = _apply(tmp_path, AS_OF, synthesis())
     t1 = AS_OF + timedelta(minutes=5)
-    priors = active_priors(load_ledger(tmp_path, INST), t1)
+    priors = active_priors(load_ledger(DB(tmp_path), INST), t1)
 
     def revise_to(replacement):
         return synthesis(prior_decisions=[{"hypothesis_id": ids["p3600"], "decision": "REVISE", "reason": "new forecast",
@@ -501,7 +512,7 @@ def test_d04_hypothesis_ids_are_unique_and_one_identity_is_used_everywhere(fixtu
         plan_ledger(INST, "debate-dup", AS_OF, SynthesisReport.model_validate(dup), [])
     _, _, _, ids = _apply(tmp_path, AS_OF, synthesis())
     t1 = AS_OF + timedelta(minutes=5)
-    priors = active_priors(load_ledger(tmp_path, INST), t1)
+    priors = active_priors(load_ledger(DB(tmp_path), INST), t1)
     reuse = synthesis()
     reuse["horizons"][0]["primary"]["hypothesis_id"] = ids["p3600"]
     keep = {"decision": "KEEP", "reason": "a", "evidence_ids": ["mkt-bars-1"]}
@@ -519,16 +530,16 @@ def test_d04_hypothesis_ids_are_unique_and_one_identity_is_used_everywhere(fixtu
     assert held and rec.hypothesis_id_map == {"p3600": "hyp-ident-h3600-0", "o3600": "hyp-ident-h3600-1",
                                               "p86400": "hyp-ident-h86400-0", "o86400": "hyp-ident-h86400-1"}
     assert "hyp-ident-h3600-0" in next(cl.text for cl in a.claims if cl.text.startswith("[1h"))
-    summary = debate_summary(root, INST, a.assessment_id, AS_OF)
+    summary = debate_summary(root, DB(root), INST, a.assessment_id, AS_OF)
     assert [hz["primary"]["canonical_id"] for hz in summary["horizons"]] == ["hyp-ident-h3600-0", "hyp-ident-h86400-0"]
-    horizon_of = {r.hypothesis_id: r.horizon_seconds for r in load_ledger(root, INST)}
+    horizon_of = {r.hypothesis_id: r.horizon_seconds for r in load_ledger(DB(root), INST)}
     assert {horizon_of[cid] for cid in rec.hypothesis_id_map.values() if "-h3600-" in cid} == {3600}
 
 
 def test_d05_budget_below_minimum_is_refused_before_any_call(fixture_cfg, tmp_path):
     cfg = _cfg(fixture_cfg, tmp_path, max_llm_calls=3)  # 2 active roles need 2 drafts + critic + synthesis = 4
     cfg.context.tradingagents.worker_python = tmp_path / "no-such-python.exe"  # proves the worker is never started
-    q = JobQueue(tmp_path / "q.sqlite")
+    q = JobQueue(DB(tmp_path))
     a = DebateBackend(cfg, q, project_root=ROOT, horizons=H).assess(make_bundle(), {"job_id": "j", "idempotency_key": "k"})
     assert a.status == ContextStatus.UNSUPPORTED and "below the minimum 4" in a.status_reasons[0]
     assert q.usage_totals_today()["calls"] == 0 and not (tmp_path / "context" / "debate_runs").exists()
@@ -563,6 +574,141 @@ def test_d05_worker_call_cap_holds_with_four_parallel_roles(tmp_path, max_calls)
         assert invoked == len(attempted) == res["calls"], name  # every attempt counted, failed ones included
         if max_calls == 8:
             assert invoked == {"plain": 6, "revise+format_fix": 8, "provider_errors": 6}[name], (name, invoked)
+
+
+# ------------------------------------------------------------------ re-review 4304c5f regressions (R01, R02)
+class _ScriptedDebate(DebateBackend):
+    """Real DebateBackend; only the worker run is replaced by a fixed scripted result. Counts backend runs."""
+
+    def assess(self, bundle, leased):
+        self.calls = getattr(self, "calls", 0) + 1
+        return _finish(self, bundle.as_of, f"debate-attempt{leased['attempts']}", job=leased)
+
+
+def _queued(fixture_cfg, root):
+    cfg = _cfg(fixture_cfg, root)
+    b = make_bundle()
+    save_bundle(root, b)
+    q = JobQueue(DB(root), max_attempts=2)
+    job = q.enqueue("k-fault", "BTCUSDT", AS_OF, b.bundle_id, "aqe_debate")
+    return cfg, q, job, _ScriptedDebate(cfg, q, project_root=ROOT, horizons=H)
+
+
+@pytest.mark.parametrize("rows_before_failure", [0, 1, 2, 3])
+def test_r01_failure_inside_a_batch_leaves_no_rows_and_the_retry_writes_the_whole_batch(fixture_cfg, tmp_path, monkeypatch,
+                                                                                        rows_before_failure):
+    import aqe.context.debate as debate_mod
+
+    cfg, q, job, be = _queued(fixture_cfg, tmp_path)
+    real, done = debate_mod._row_json, {"n": 0}
+
+    def failing(r):  # I/O failure after N complete rows of the 4-row batch were inserted
+        if done["n"] >= rows_before_failure:
+            raise OSError(f"simulated I/O failure after {rows_before_failure} complete rows")
+        done["n"] += 1
+        return real(r)
+
+    monkeypatch.setattr(debate_mod, "_row_json", failing)
+    first = process_one(cfg, q, be, "worker-first")
+    assert first["result"].startswith("commit failed") and q.get(job["job_id"])["status"] == "PENDING"
+    assert done["n"] == rows_before_failure  # that many complete rows were written in the transaction ...
+    assert load_ledger(DB(tmp_path), INST) == [] and q.outbox_pending() == []  # ... and none survived the rollback
+    assert not assessments_dir(tmp_path, INST).exists()
+    monkeypatch.setattr(debate_mod, "_row_json", real)
+    retry = process_one(cfg, q, be, "worker-retry")
+    assert q.get(job["job_id"])["status"] == "DONE" and Path(retry["path"]).exists()
+    ledger = load_ledger(DB(tmp_path), INST)
+    assert len(ledger) == 4 and {r.horizon_seconds for r in ledger} == {3600, 86400} and verify_ledger(DB(tmp_path), INST) == []
+    rec = load_debate(tmp_path, INST, retry["assessment_id"])
+    assert rec.applied_to_ledger and rec.ledger_note == "applied" and len(rec.hypothesis_id_map) == 4
+
+
+def test_r01_ledger_is_append_only_and_batch_integrity_is_checked(tmp_path):
+    _apply(tmp_path, AS_OF, synthesis())
+    db = DB(tmp_path)
+    assert verify_ledger(db, INST) == []
+    with connect(db) as c:
+        for sql in ("UPDATE hypothesis_ledger SET record_json='{}'", "DELETE FROM hypothesis_ledger",
+                    "UPDATE hypothesis_batches SET row_count=0", "DELETE FROM hypothesis_batches"):
+            with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+                c.execute(sql)
+        batch = c.execute("SELECT batch_id FROM hypothesis_batches LIMIT 1").fetchone()["batch_id"]
+        c.execute("INSERT INTO hypothesis_ledger (record_id, batch_id, instrument_slug, hypothesis_id, as_of, record_json) "
+                  "VALUES ('hr-forged', ?, ?, 'x', 'x', '{}')", (batch, INST.slug()))
+    with pytest.raises(LedgerIntegrityError):  # a batch that does not match its recorded size fails closed
+        load_ledger(db, INST)
+    assert any("MISMATCH" in p for p in verify_ledger(db, INST))
+
+
+@pytest.mark.parametrize("stage", ["debate_record_write", "assessment_write", "crash_after_commit"])
+def test_r02_post_commit_failures_are_recovered_from_the_outbox_without_rerun(fixture_cfg, tmp_path, monkeypatch, stage):
+    import aqe.context.store as store_mod
+    import aqe.context.worker as worker_mod
+
+    cfg, q, job, be = _queued(fixture_cfg, tmp_path)
+    if stage == "crash_after_commit":
+        real_mat = worker_mod.materialize_outbox
+
+        class Crash(BaseException):
+            pass
+
+        def crash(data_root, queue, ids=None):
+            if ids:  # the process dies right after the queue COMMIT, before any result file is written
+                raise Crash
+            return real_mat(data_root, queue, ids)
+
+        monkeypatch.setattr(worker_mod, "materialize_outbox", crash)
+        with pytest.raises(Crash):
+            process_one(cfg, q, be, "worker-first")
+        monkeypatch.setattr(worker_mod, "materialize_outbox", real_mat)
+    else:
+        real_write = store_mod.atomic_write_json
+        target = ".debate.json" if stage == "debate_record_write" else f"{os.sep}assessments{os.sep}"
+
+        def failing(path, obj):
+            if target in str(path):
+                raise OSError(f"simulated {stage} failure after queue COMMIT")
+            return real_write(path, obj)
+
+        monkeypatch.setattr(store_mod, "atomic_write_json", failing)
+        first = process_one(cfg, q, be, "worker-first")
+        assert first["result"].startswith("committed; result files pending")
+        monkeypatch.setattr(store_mod, "atomic_write_json", real_write)
+    st = q.get(job["job_id"])
+    aid = st["result_assessment_id"]
+    path = assessments_dir(tmp_path, INST) / f"{aid}.json"
+    assert st["status"] == "DONE" and len(load_ledger(DB(tmp_path), INST)) == 4  # committed ...
+    assert not path.exists() and [r["assessment_id"] for r in q.outbox_pending()] == [aid]  # ... files still pending
+    assert process_one(cfg, q, be, "worker-restarted") == {"recovered": [aid]}  # next worker run, nothing left to lease
+    assert be.calls == 1  # the backend (LLM) was not run again
+    assert path.exists() and q.outbox_pending() == []
+    assert "hypothesis ledger: applied" in json.loads(path.read_text(encoding="utf-8"))["status_reasons"]
+    rec = load_debate(tmp_path, INST, aid)  # audit metadata matches the committed ledger
+    assert rec.applied_to_ledger and rec.ledger_note == "applied" and len(rec.hypothesis_id_map) == 4
+    assert len(load_ledger(DB(tmp_path), INST)) == 4 and process_one(cfg, q, be, "worker-idle") is None
+
+
+def test_r02_every_backend_result_goes_through_the_outbox(fixture_cfg, tmp_path, monkeypatch):
+    import aqe.context.store as store_mod
+    from aqe.context.backends import OfflineFixtureBackend
+
+    cfg = _cfg(fixture_cfg, tmp_path)
+    cfg.context.backend = "offline_fixture"
+    b = make_bundle()
+    save_bundle(tmp_path, b)
+    q = JobQueue(DB(tmp_path))
+    job = q.enqueue("k-fixture", "BTCUSDT", AS_OF, b.bundle_id, "offline_fixture")
+    real_write = store_mod.atomic_write_json
+
+    def disk_full(path, obj):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store_mod, "atomic_write_json", disk_full)
+    first = process_one(cfg, q, OfflineFixtureBackend(cfg), "w1")
+    assert first["result"].startswith("committed; result files pending") and q.get(job["job_id"])["status"] == "DONE"
+    monkeypatch.setattr(store_mod, "atomic_write_json", real_write)
+    assert process_one(cfg, q, OfflineFixtureBackend(cfg), "w2") == {"recovered": [first["assessment_id"]]}
+    assert (assessments_dir(tmp_path, INST) / f"{first['assessment_id']}.json").exists()
 
 
 _ = (RuleOutcome, Path)

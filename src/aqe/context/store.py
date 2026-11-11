@@ -6,6 +6,7 @@ Layout: {data_root}/context/bundles/{bundle_id}.json
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,6 +45,31 @@ def save_assessment(data_root: Path, a: ContextAssessment) -> Path:
     p = assessments_dir(data_root, a.instrument) / f"{a.assessment_id}.json"
     atomic_write_json(p, a.model_dump(mode="json"))
     return p
+
+
+def materialize_outbox(data_root: Path, queue, ids: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
+    """Write committed results from the queue DB outbox to files (ADR-0013). Idempotent (atomic overwrites).
+
+    Audit files (e.g. the debate record) are written first and the assessment last, so a reader never sees an
+    assessment whose audit record is missing. On failure the entry stays pending (error recorded) and the next worker
+    run writes it again from the stored result — the LLM is never re-run. Returns (materialized ids, {id: error})."""
+    done: list[str] = []
+    errors: dict[str, str] = {}
+    for row in queue.outbox_pending(ids):
+        aid = row["assessment_id"]
+        try:
+            for f in json.loads(row["files_json"] or "[]"):
+                atomic_write_json(Path(data_root) / f["relpath"], f["json"])
+            save_assessment(data_root, ContextAssessment.model_validate_json(row["assessment_json"]))
+            queue.outbox_mark(aid, None)
+            done.append(aid)
+        except Exception as exc:  # noqa: BLE001 - stays pending; retried by the next worker run
+            errors[aid] = f"{type(exc).__name__}: {exc}"[:500]
+            try:
+                queue.outbox_mark(aid, errors[aid])
+            except Exception:  # noqa: BLE001 - the pending state itself is the durable signal
+                pass
+    return done, errors
 
 
 def ready_time(a: ContextAssessment, replay: bool) -> datetime:

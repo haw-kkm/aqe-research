@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import subprocess
 import time
@@ -66,7 +65,9 @@ from aqe.contracts.debate import (
     RoleStatus,
     SynthesisReport,
 )
+from aqe.context.store import materialize_outbox
 from aqe.storage import atomic_write_json
+from aqe.storage.metadb import JobQueue, connect, init_sqlite, sqlite_path
 
 PROMPT_VERSION = "aqe-debate-v0.1"
 
@@ -222,48 +223,78 @@ def prompts_hash(prompts: dict[str, Any]) -> str:
     return hashlib.sha256((PROMPT_VERSION + json.dumps(templates, sort_keys=True, default=str)).encode()).hexdigest()
 
 
-# ---------------------------------------------------------------- hypothesis ledger (append-only JSONL)
-def ledger_path(data_root: Path, inst: InstrumentKey) -> Path:
-    return Path(data_root) / "context" / "hypotheses" / f"{inst.slug()}.jsonl"
+# ---------------------------------------------------------------- hypothesis ledger (SQLite, append-only; ADR-0013)
+# The ledger lives in the queue database (`sqlite_path(cfg)`) as tables hypothesis_ledger + hypothesis_batches, so a
+# batch of rows, the job completion and the result outbox entry commit in ONE transaction (review R01/R02). A batch is
+# all-or-nothing; UPDATE/DELETE are refused by triggers. Legacy JSONL ledgers (`context/hypotheses/*.jsonl`, dev-only
+# scripted runs before ADR-0013) are not read.
+class LedgerIntegrityError(RuntimeError):
+    """A committed batch does not match its recorded row count / content hash — fail closed, inspect manually."""
 
 
-def load_ledger(data_root: Path, inst: InstrumentKey) -> list[HypothesisRecord]:
-    p = ledger_path(data_root, inst)
-    if not p.exists():
-        return []
-    return [HypothesisRecord.model_validate_json(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+_SCHEMA_READY: set[str] = set()
 
 
-def append_ledger(data_root: Path, inst: InstrumentKey, rows: list[HypothesisRecord]) -> None:
-    """Append rows in one write + fsync. Callers that change the active ledger go through commit_ledger (lock + checks)."""
-    if not rows:
-        return
-    p = ledger_path(data_root, inst)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as fh:
-        fh.write("".join(r.model_dump_json() + "\n" for r in rows))
-        fh.flush()
-        os.fsync(fh.fileno())
+def _ensure_schema(db: Path) -> None:
+    if str(db) not in _SCHEMA_READY:
+        init_sqlite(Path(db))
+        _SCHEMA_READY.add(str(db))
+
+
+@contextmanager
+def _tx(db: Path) -> Iterator[sqlite3.Connection]:
+    """One write transaction on the ledger/queue database (BEGIN IMMEDIATE: serialised across processes)."""
+    _ensure_schema(db)
+    with connect(Path(db)) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            yield c
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+
+
+def _row_json(r: HypothesisRecord) -> str:
+    return r.model_dump_json()
+
+
+def _read_ledger(c: sqlite3.Connection, inst: InstrumentKey) -> list[HypothesisRecord]:
+    slug = inst.slug()
+    short = c.execute("SELECT b.batch_id, b.row_count, count(l.seq) AS n FROM hypothesis_batches b LEFT JOIN hypothesis_ledger l "
+                      "ON l.batch_id = b.batch_id WHERE b.instrument_slug=? GROUP BY b.batch_id HAVING n <> b.row_count", (slug,)).fetchall()
+    orphan = c.execute("SELECT count(*) FROM hypothesis_ledger l LEFT JOIN hypothesis_batches b ON b.batch_id = l.batch_id "
+                       "WHERE l.instrument_slug=? AND b.batch_id IS NULL", (slug,)).fetchone()[0]
+    if short or orphan:
+        raise LedgerIntegrityError(f"{slug}: batches with wrong row count {[dict(r) for r in short][:3]}, rows without batch {orphan}")
+    return [HypothesisRecord.model_validate_json(r["record_json"])
+            for r in c.execute("SELECT record_json FROM hypothesis_ledger WHERE instrument_slug=? ORDER BY seq", (slug,))]
+
+
+def load_ledger(db: Path, inst: InstrumentKey) -> list[HypothesisRecord]:
+    """All rows of one instrument in commit order (`db` = the queue database, `sqlite_path(cfg)`)."""
+    _ensure_schema(db)
+    with connect(Path(db)) as c:
+        return _read_ledger(c, inst)
+
+
+def verify_ledger(db: Path, inst: InstrumentKey) -> list[str]:
+    """Recompute every batch's row count and content hash; returns problems (empty = intact)."""
+    _ensure_schema(db)
+    problems = []
+    with connect(Path(db)) as c:
+        for b in c.execute("SELECT * FROM hypothesis_batches WHERE instrument_slug=? ORDER BY committed_at", (inst.slug(),)).fetchall():
+            rows = [r["record_json"] for r in c.execute("SELECT record_json FROM hypothesis_ledger WHERE batch_id=? ORDER BY seq", (b["batch_id"],))]
+            h = hashlib.sha256("".join(js + "\n" for js in rows).encode()).hexdigest()
+            if len(rows) != b["row_count"] or h != b["rows_sha256"]:
+                problems.append(f"batch {b['batch_id']}: {len(rows)}/{b['row_count']} rows, hash {'ok' if h == b['rows_sha256'] else 'MISMATCH'}")
+    return problems
 
 
 def ledger_version(records: list[HypothesisRecord]) -> str:
     """Identity of an append-only ledger state: row count + last record id."""
     return f"{len(records)}:{records[-1].record_id}" if records else "0:"
-
-
-@contextmanager
-def ledger_lock(data_root: Path, inst: InstrumentKey, timeout: float = 30.0) -> Iterator[None]:
-    """Cross-process mutex for one instrument's ledger (SQLite write lock; works on Windows and POSIX)."""
-    p = ledger_path(data_root, inst)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(p.with_name(p.stem + ".lock.sqlite")), timeout=timeout, isolation_level=None)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        yield
-    finally:
-        if con.in_transaction:
-            con.execute("ROLLBACK")
-        con.close()
 
 
 def states_at(records: list[HypothesisRecord], as_of: datetime) -> dict[str, HypothesisRecord]:
@@ -428,11 +459,12 @@ def check_debate(res: dict, bundle: EvidenceBundle, active: list[AnalystRole], h
             "failures": failures, "role_status": role_status, "status": status}
 
 
-# ---------------------------------------------------------------- ledger application (plan -> locked commit)
+# ---------------------------------------------------------------- ledger application (plan -> transactional commit)
 # Two phases (review D01/D02): the debate PLANS its rows from the ledger state it read before the LLM run; the rows
-# change the active ledger only in commit_ledger, which re-reads the ledger under a lock and refuses the plan if the
-# ledger moved on (newer as_of = late result; same as_of but other rows = conflict) or if this job was already applied.
-# The worker path runs commit_ledger inside JobQueue.complete_with, so a worker that lost its lease never writes.
+# change the ledger only in commit_ledger, which runs INSIDE a write transaction, re-reads the ledger and refuses the
+# plan if the ledger moved on (newer as_of = late result; same as_of but other rows = conflict) or if this job was
+# already applied. The worker path runs it inside JobQueue.complete_with: lease check + batch + outbox + DONE in one
+# SQLite transaction (ADR-0012/0013), so neither a lost lease nor an I/O error can leave a partial batch.
 @dataclass
 class LedgerPlan:
     instrument: InstrumentKey
@@ -507,31 +539,47 @@ def plan_ledger(inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis:
     return plan
 
 
-def commit_ledger(data_root: Path, plan: LedgerPlan) -> tuple[bool, str]:
-    """Apply a plan under the ledger lock, re-validated against the CURRENT ledger. Returns (applied, note)."""
+def commit_ledger(c: sqlite3.Connection, plan: LedgerPlan, assessment_id: str | None = None) -> tuple[bool, str]:
+    """Apply a plan on the caller's open write transaction, re-validated against the CURRENT ledger.
+    Returns (applied, note). The whole batch (rows + batch record with count and content hash) is inserted on `c`;
+    if anything raises, the caller's transaction rolls back and no row of the batch remains."""
     if not plan.applicable:
         return False, plan.note
-    with ledger_lock(data_root, plan.instrument):
-        current = load_ledger(data_root, plan.instrument)
-        if plan.job_id and any(r.job_id == plan.job_id for r in current):
-            return False, f"job {plan.job_id} was already applied by an earlier attempt; not applied twice"
-        latest = max((r.as_of for r in current), default=None)
-        if latest is not None and plan.as_of < latest:
-            return False, (f"late arrival: as_of {iso_utc(plan.as_of)} is older than ledger state {iso_utc(latest)} "
-                           "(written while this debate ran); not applied")
-        now_version = ledger_version(current)
-        if now_version != plan.base_version:
-            return False, (f"ledger changed while this debate ran (read {plan.base_version}, now {now_version}); its prior "
-                           "decisions refer to a stale state — not applied, re-run on the current ledger")
-        append_ledger(data_root, plan.instrument, plan.rows)
+    current = _read_ledger(c, plan.instrument)
+    if plan.job_id and c.execute("SELECT 1 FROM hypothesis_batches WHERE job_id=?", (plan.job_id,)).fetchone():
+        return False, f"job {plan.job_id} was already applied; not applied twice"
+    latest = max((r.as_of for r in current), default=None)
+    if latest is not None and plan.as_of < latest:
+        return False, (f"late arrival: as_of {iso_utc(plan.as_of)} is older than ledger state {iso_utc(latest)} "
+                       "(written while this debate ran); not applied")
+    now_version = ledger_version(current)
+    if now_version != plan.base_version:
+        return False, (f"ledger changed while this debate ran (read {plan.base_version}, now {now_version}); its prior "
+                       "decisions refer to a stale state — not applied, re-run on the current ledger")
+    slug, batch_id, h = plan.instrument.slug(), f"hb-{uuid.uuid4().hex[:12]}", hashlib.sha256()
+    for r in plan.rows:
+        js = _row_json(r)
+        c.execute("INSERT INTO hypothesis_ledger (record_id, batch_id, instrument_slug, hypothesis_id, as_of, record_json) "
+                  "VALUES (?,?,?,?,?,?)", (r.record_id, batch_id, slug, r.hypothesis_id, iso_utc(r.as_of), js))
+        h.update((js + "\n").encode())
+    c.execute("INSERT INTO hypothesis_batches (batch_id, instrument_slug, job_id, debate_id, assessment_id, as_of, base_version, "
+              "row_count, rows_sha256, committed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (batch_id, slug, plan.job_id, plan.debate_id, assessment_id, iso_utc(plan.as_of), plan.base_version, len(plan.rows),
+               h.hexdigest(), iso_utc(utc_now())))
     return True, plan.note
 
 
-def apply_to_ledger(data_root: Path, inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis: SynthesisReport | None,
+def commit_plan(db: Path, plan: LedgerPlan, assessment_id: str | None = None) -> tuple[bool, str]:
+    """commit_ledger in its own transaction (direct use without a queue job)."""
+    with _tx(db) as c:
+        return commit_ledger(c, plan, assessment_id)
+
+
+def apply_to_ledger(db: Path, inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis: SynthesisReport | None,
                     records: list[HypothesisRecord], job_id: str | None = None) -> tuple[list[HypothesisRecord], bool, str, dict[str, str]]:
     """plan + commit (no queue lease involved). Returns (rows appended, applied?, note, id_map llm-id -> canonical id)."""
     plan = plan_ledger(inst, debate_id, as_of, synthesis, records, job_id)
-    applied, note = commit_ledger(data_root, plan)
+    applied, note = commit_plan(db, plan)
     return (plan.rows, True, note, plan.id_map) if applied else ([], False, note, {})
 
 
@@ -584,6 +632,7 @@ class _PendingCommit:
     plan: LedgerPlan
     checked: dict[str, Any]
     status: ContextStatus  # candidate status before the common validation
+    record: DebateRecord  # pre-commit audit record; its final version is stored in the outbox with the commit
 
 
 class DebateBackend:
@@ -592,6 +641,7 @@ class DebateBackend:
     Two-phase: `assess` returns a CANDIDATE assessment and only plans its hypothesis-ledger rows; `commit` applies
     them (worker path: inside JobQueue.complete_with, i.e. only while the lease is still held, after the common
     validation, against the current ledger version). Direct callers without a queue job call `commit(a)`.
+    The ledger and the result outbox live in the queue database (`self.db`), so the commit is one transaction.
     """
 
     name = "aqe_debate"
@@ -602,6 +652,8 @@ class DebateBackend:
         self.horizons = horizons
         self._reservation: tuple[float, bool, int] | None = None
         self._pending: dict[str, _PendingCommit] = {}
+        self.db = Path(queue.path) if queue is not None else sqlite_path(cfg)  # ledger + outbox (same DB as the job queue)
+        self._outbox = queue if queue is not None else JobQueue(self.db)
 
     def _horizons(self) -> list[int]:
         if self.horizons:
@@ -630,7 +682,7 @@ class DebateBackend:
         horizons = self._horizons()
         status, notes = activation(bundle, dcfg.roles)
         active = [r for r in AnalystRole if status[r] == RoleStatus.ACTIVE]
-        records = load_ledger(cfg.paths.data_root, inst)
+        records = load_ledger(self.db, inst)
         priors = active_priors(records, bundle.as_of)
         prompts = build_prompts(bundle, active, horizons, priors)
         ph = prompts_hash(prompts)
@@ -726,53 +778,67 @@ class DebateBackend:
                               evidence_ids_used=tuple(sorted({i for c in (*claims, *counter) for i in c.evidence_ids})),
                               temporal_scope=TemporalScope.INTRADAY_ASOF_VERIFIED if clean else TemporalScope.UNVERIFIED,
                               contextual_rating=None, review_required=review, status=st, status_reasons=tuple(reasons), usage=usage)
-        self._store(bundle, a, debate_id, status, role_notes, checked, calls, ph, False, "pending commit", plan.base_version)
-        self._pending[a.assessment_id] = _PendingCommit(plan=plan, checked=checked, status=a.status)
+        rec = self._store(bundle, a, debate_id, status, role_notes, checked, calls, ph, False, "pending commit", plan.base_version)
+        self._pending[a.assessment_id] = _PendingCommit(plan=plan, checked=checked, status=a.status, record=rec)
         return a
 
     def commit(self, a: ContextAssessment, job: dict[str, Any] | None = None, owner: str | None = None,
                queue=None) -> tuple[bool, ContextAssessment]:
         """Phase 2. Returns (lease_held, final assessment).
 
-        With job + owner + queue (worker path) the planned rows are applied inside JobQueue.complete_with: the lease
-        is verified under the queue's write lock, the ledger is re-checked (job not applied before, not late, version
-        unchanged) and the job is marked DONE in the same transaction. A worker that lost its lease writes nothing
-        (its debate record keeps the audit trail). Without a job (direct use) only the ledger lock and checks apply."""
+        One SQLite transaction on the queue database: (worker path) verify the lease, re-check the ledger (job not
+        applied before, not late, version unchanged), insert the whole batch, store the FINAL assessment and debate
+        record in the result outbox, mark the job DONE. Any exception rolls all of it back. Files are written only
+        afterwards from the outbox (`materialize_outbox`: by process_one, or here for direct use); if that fails the
+        next worker run re-writes them from the stored result, without re-running the LLM. A worker that lost its
+        lease commits nothing (its pre-commit debate record keeps the audit trail)."""
         pend = self._pending.pop(a.assessment_id, None)
         q = queue if queue is not None else self.queue
         leased = job is not None and owner is not None and q is not None
-        if pend is None:  # no debate ran to the checks (missing data, unsupported, worker failure): nothing to apply
-            return (q.complete(job["job_id"], owner, a.assessment_id) if leased else True), a
+        if leased and Path(q.path) != self.db:
+            raise ValueError(f"ledger DB {self.db} must be the queue DB {q.path} (one transaction)")
 
-        def apply() -> tuple[bool, str]:
-            if a.status == ContextStatus.INVALID and pend.status != ContextStatus.INVALID:
-                return False, "common validation rejected the assessment; ledger unchanged"
-            return commit_ledger(self.cfg.paths.data_root, pend.plan)
+        def tx(c: sqlite3.Connection) -> ContextAssessment:
+            final, files = a, []
+            if pend is not None:
+                if a.status == ContextStatus.INVALID and pend.status != ContextStatus.INVALID:
+                    applied, note = False, "common validation rejected the assessment; ledger unchanged"
+                else:
+                    applied, note = commit_ledger(c, pend.plan, assessment_id=a.assessment_id)
+                upd: dict[str, Any] = {"status_reasons": (*a.status_reasons, f"hypothesis ledger: {note}")}
+                if not applied and pend.plan.id_map:  # canonical ids were never written: label claims with the debate's own ids
+                    claims, counter, _ = project(pend.checked, {})
+                    upd.update(claims=claims, counterclaims=counter)
+                final = a.model_copy(update=upd)
+                rec = pend.record.model_copy(update={"applied_to_ledger": applied, "ledger_note": note,
+                                                     "hypothesis_id_map": dict(pend.plan.id_map) if applied else {}})
+                files.append(_debate_file(rec))
+            JobQueue.outbox_put(c, final, (job or {}).get("job_id"), files)
+            return final
 
         if leased:
-            held, out = q.complete_with(job["job_id"], owner, a.assessment_id, apply)
+            held, final = q.complete_with(job["job_id"], owner, a.assessment_id, tx)
             if not held:
-                self._record_commit(a, False, "lease lost before commit: result discarded, ledger unchanged", {})
+                if pend is not None:
+                    self._audit_lease_lost(pend.record)
                 return False, a
-        else:
-            out = apply()
-        applied, note = out
-        self._record_commit(a, applied, note, pend.plan.id_map if applied else {})
-        upd: dict[str, Any] = {"status_reasons": (*a.status_reasons, f"hypothesis ledger: {note}")}
-        if not applied and pend.plan.id_map:  # canonical ids were never written: label claims with the debate's own ids
-            claims, counter, _ = project(pend.checked, {})
-            upd.update(claims=claims, counterclaims=counter)
-        return True, a.model_copy(update=upd)
+            return True, final  # process_one materializes the files
+        with _tx(self.db) as c:
+            final = tx(c)
+        materialize_outbox(self.cfg.paths.data_root, self._outbox, ids=[a.assessment_id])  # on failure: stays pending
+        return True, final
 
-    def _record_commit(self, a: ContextAssessment, applied: bool, note: str, id_map: dict[str, str]) -> None:
-        rec = load_debate(self.cfg.paths.data_root, a.instrument, a.assessment_id)
-        if rec is None:
-            return
-        rec = rec.model_copy(update={"applied_to_ledger": applied, "ledger_note": note, "hypothesis_id_map": dict(id_map)})
-        atomic_write_json(debates_dir(self.cfg.paths.data_root, a.instrument) / f"{a.assessment_id}.debate.json", rec.model_dump(mode="json"))
+    def _audit_lease_lost(self, rec: DebateRecord) -> None:
+        """Best effort: mark the discarded result's pre-commit record (nothing was committed for it)."""
+        f = _debate_file(rec.model_copy(update={"applied_to_ledger": False, "hypothesis_id_map": {},
+                                                "ledger_note": "lease lost before commit: result discarded, ledger unchanged"}))
+        try:
+            atomic_write_json(Path(self.cfg.paths.data_root) / f["relpath"], f["json"])
+        except OSError:
+            pass  # the record still says "pending commit", which is also true: it was never committed
 
     def _store(self, bundle, a: ContextAssessment, debate_id, status, role_notes, checked, calls, ph, applied, note,
-               base_version: str | None = None) -> None:
+               base_version: str | None = None) -> DebateRecord:
         cfg = self.cfg
         rec = DebateRecord(
             debate_id=debate_id, assessment_id=a.assessment_id, instrument=bundle.instruments[0], as_of=bundle.as_of,
@@ -783,17 +849,22 @@ class DebateBackend:
             check_failures=tuple(checked["failures"]), llm_calls=calls, max_llm_calls=cfg.context.debate.max_llm_calls,
             provider=cfg.context.llm.provider, model_id=cfg.context.llm.model_id, prompt_hash=ph, code_version=__version__,
             status=checked["status"], applied_to_ledger=applied, ledger_note=note, ledger_base_version=base_version)
-        d = debates_dir(cfg.paths.data_root, bundle.instruments[0])
-        d.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(d / f"{a.assessment_id}.debate.json", rec.model_dump(mode="json"))
+        f = _debate_file(rec)
+        atomic_write_json(Path(cfg.paths.data_root) / f["relpath"], f["json"])  # pre-commit audit copy
+        return rec
 
 
-def debate_summary(data_root: Path, inst: InstrumentKey, assessment_id: str, as_of: datetime) -> dict[str, Any] | None:
-    """Report view of a stored debate: canonical hypothesis ids and their ledger state at as_of."""
+def _debate_file(rec: DebateRecord) -> dict[str, Any]:
+    """Debate record as an outbox file entry (path relative to data_root)."""
+    return {"relpath": f"context/debates/{rec.instrument.slug()}/{rec.assessment_id}.debate.json", "json": rec.model_dump(mode="json")}
+
+
+def debate_summary(data_root: Path, db: Path, inst: InstrumentKey, assessment_id: str, as_of: datetime) -> dict[str, Any] | None:
+    """Report view of a stored debate: canonical hypothesis ids and their ledger state at as_of (`db` = sqlite_path(cfg))."""
     rec = load_debate(data_root, inst, assessment_id)
     if rec is None:
         return None
-    ledger = load_ledger(data_root, inst)
+    ledger = load_ledger(db, inst)
     states = {k: v.state.value for k, v in states_at(ledger, as_of).items()}
     syn = rec.synthesis
     id_map = rec.hypothesis_id_map  # same identity contract as the ledger and the projection

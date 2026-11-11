@@ -105,3 +105,25 @@
   hypothesis_id_map` is the single LLM-id → canonical-id map used by ledger rows, projected claims and the report.
 - Call cap: the worker takes a slot from one lock-protected counter before every model invocation (never refunded,
   failed calls included); core refuses before reserving budget when `max_llm_calls < active roles + 2`.
+
+## ADR-0013 — Ledger, result outbox and job completion in one SQLite transaction (re-review 4304c5f, R01/R02)
+- Context: ADR-0012 appended JSONL rows inside the queue transaction, but a file append does not roll back with SQLite.
+  An I/O error after some complete rows left a partial batch that the retry then treated as "already applied" (R01).
+  Files written after the queue COMMIT (debate record, assessment) could fail with the job already DONE and no path
+  to recover them (R02).
+- Decision: the hypothesis ledger moves into the queue database (`sqlite_path(cfg)`): `hypothesis_ledger` (rows, in
+  commit order) + `hypothesis_batches` (one per commit: job_id UNIQUE, row_count, sha256 of the rows). UPDATE/DELETE
+  are refused by triggers. `DebateBackend.commit` runs inside `JobQueue.complete_with(on_commit(conn))`, which in ONE
+  transaction checks the lease, re-validates the ledger (ADR-0012), inserts the whole batch, stores the FINAL
+  assessment + final DebateRecord in `context_outbox` and marks the job DONE. Any exception rolls everything back, so a
+  batch is all-or-nothing and the job is retried as a whole. `load_ledger` refuses a batch whose row count does not
+  match (LedgerIntegrityError); `verify_ledger` re-checks the hashes.
+- Files are written only from the outbox (`context/store.materialize_outbox`): audit files first, the assessment last
+  (a reader never sees an assessment without its record), then `materialized_at` is set. If writing fails, the entry
+  stays pending (error recorded) and every `process_one` call first re-writes pending entries — the LLM is not re-run
+  and the job is not reopened. Every backend's result now goes through the outbox (not only `aqe_debate`).
+- Supersedes the storage part of ADR-0012 (JSONL ledger + ledger lock file). Legacy `context/hypotheses/*.jsonl`
+  (dev-only scripted runs) are not read or migrated. The PostgreSQL target schema gets the same tables
+  (`migrations/postgres/002_hypothesis_ledger_outbox.sql`, not executed — no server).
+- Residual: a crash between materialization and `materialized_at` re-writes identical files (atomic, idempotent).
+  The pre-commit DebateRecord written in `finish` stays "pending commit" if the job is never committed — that is true.
