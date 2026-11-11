@@ -253,7 +253,57 @@ def news_items(cfg: LocalConfig, as_of: datetime) -> tuple[list[EvidenceItem], S
                                coverage_start=cover[0].to_pydatetime(), coverage_end=cover[1].to_pydatetime())
 
 
-def build_bundle(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> EvidenceBundle:
+def numeric_evidence(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> tuple[list[EvidenceItem], SourceHealth]:
+    """Read-only adapter (debate proposal §10-1, §12): AQE's registered numeric predictions at as_of.
+
+    Uses the same point-in-time path as `aqe analyze` (snapshot from bars available at as_of, artifact
+    identity/cutoff/lineage checks, validation results only if established by as_of). The output is a
+    model estimate with its readiness and restrictions; it is never re-written by the debate layer."""
+    from aqe.config import load_experiment_config
+    from aqe.contracts.core import RuntimeMode
+    from aqe.ensemble.online import predict_horizon
+    from aqe.features.ohlcv_v0 import MAX_LOOKBACK_BARS, compute_ohlcv_v0
+    from aqe.features.snapshot import build_snapshot
+    from aqe.storage.bars import to_grid
+
+    try:
+        exp, _ = load_experiment_config(cfg.analysis.experiment_config)
+    except (OSError, ValueError) as exc:
+        return [], SourceHealth(source_kind=SourceKind.AQE_NUMERIC, status=SourceHealthStatus.NOT_CONFIGURED,
+                                detail=f"experiment config unavailable: {type(exc).__name__}")
+    bars = read_bars(cfg.paths.data_root, inst, "5m", start=as_of - timedelta(days=12), end=as_of + timedelta(minutes=5))
+    sel = bars_as_of(bars, as_of)
+    if sel.empty:
+        return [], SourceHealth(source_kind=SourceKind.AQE_NUMERIC, status=SourceHealthStatus.MISSING, detail="no bars at as_of")
+    snap, _ = build_snapshot(bars, inst, as_of, exp.bar_interval_seconds)
+    ff = compute_ohlcv_v0(to_grid(sel.tail(MAX_LOOKBACK_BARS + 600), exp.bar_interval_seconds), exp.bar_interval_seconds)
+    items = []
+    for h in exp.horizons_seconds:
+        preds, ens, _ = predict_horizon(artifact_root=cfg.paths.artifact_root, experiment_id=exp.experiment_id, snapshot=snap,
+                                        feature_frame=ff, horizon_seconds=h, mode=RuntimeMode.REPLAY,
+                                        interval_seconds=exp.bar_interval_seconds, context=None)
+
+        def fmt(p):
+            return "n/a" if p is None else f"down {p.p_down:.3f} / neutral {p.p_neutral:.3f} / up {p.p_up:.3f}"
+
+        base = "; ".join(f"{p.model_kind}: {fmt(p.probabilities)} ({p.status.value}, {p.readiness.value})" for p in preds)
+        if ens.probabilities is not None:
+            comb = f"calibrated combined: {fmt(ens.probabilities)}"
+        else:
+            comb = f"combined: ABSTAIN ({'; '.join(ens.abstain_reasons)[:300]})"
+        excerpt = (f"AQE numeric model estimate for {inst.instrument_id}, horizon {h // 3600}h, as_of {iso_utc(as_of)} "
+                   f"(feature profile {snap.feature_profile.value}, snapshot quality {snap.quality.value}). {comb}. Base models: {base}. "
+                   f"Readiness {ens.readiness.value}; calibration validated at as_of: {ens.calibration_validated}; "
+                   f"locked-test verdicts known at as_of: skill={ens.extra.get('oos_verdict')}, cost={ens.extra.get('oos_cost_verdict')}. "
+                   "Class labels are vol-scaled 3-class directions; these are model probabilities, not facts, and carry no expected return.")
+        items.append(_item(f"aqe-num-h{h}-{to_ms(as_of)}", SourceKind.AQE_NUMERIC, f"aqe.{exp.experiment_id}",
+                           f"AQE numeric prediction ({h // 3600}h)", excerpt, as_of, event_time=as_of,
+                           status=VerificationStatus.VERIFIED, scope=[inst.instrument_id], max_len=2000))
+    return items, SourceHealth(source_kind=SourceKind.AQE_NUMERIC, status=SourceHealthStatus.AVAILABLE,
+                               detail=f"{len(items)} horizon estimate(s) from {exp.experiment_id}", last_available_at=as_of)
+
+
+def build_bundle(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime, include_numeric: bool = False) -> EvidenceBundle:
     m_items, m_health = market_evidence(cfg, inst, as_of)
     cal, cal_health = calendar_events(cfg, as_of)
     n_items, n_health = news_items(cfg, as_of)
@@ -261,7 +311,11 @@ def build_bundle(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> Evid
         SourceHealth(source_kind=k, status=SourceHealthStatus.NOT_CONFIGURED, detail="no provider connected")
         for k in (SourceKind.SOCIAL, SourceKind.CROSS_ASSET, SourceKind.ONCHAIN, SourceKind.CRYPTO_FUNDAMENTAL)
     ]
-    items = tuple(m_items + n_items)
+    num_items: list[EvidenceItem] = []
+    if include_numeric:
+        num_items, num_health = numeric_evidence(cfg, inst, as_of)
+        health.append(num_health)
+    items = tuple(m_items + n_items + num_items)
     h = compute_bundle_hash((inst,), as_of, items, tuple(cal), tuple(health))
     return EvidenceBundle(bundle_id=f"bundle-{inst.instrument_id}-{to_ms(as_of)}-{h[:10]}", instruments=(inst,), as_of=as_of,
                           items=items, calendar_snapshot=tuple(cal), source_health=tuple(health), bundle_hash=h)
