@@ -432,6 +432,10 @@ def make_backend(cfg: LocalConfig, queue=None):
         return SimpleLLMBackend(cfg, queue)
     if b == "tradingagents":
         return TradingAgentsBackend(cfg, queue)
+    if b == "aqe_debate":
+        from aqe.context.debate import DebateBackend
+
+        return DebateBackend(cfg, queue)
     return None
 
 

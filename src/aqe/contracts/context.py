@@ -23,6 +23,7 @@ class SourceKind(StrEnum):
     CROSS_ASSET = "CROSS_ASSET"
     ONCHAIN = "ONCHAIN"
     CRYPTO_FUNDAMENTAL = "CRYPTO_FUNDAMENTAL"
+    AQE_NUMERIC = "AQE_NUMERIC"  # AQE's own registered model outputs at as_of (read-only; model estimates, not facts)
 
 
 class VerificationStatus(StrEnum):

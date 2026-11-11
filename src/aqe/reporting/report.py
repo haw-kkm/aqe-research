@@ -35,6 +35,7 @@ class AnalysisReport:
     unverified: list[str] = field(default_factory=list)
     config_hash: str = ""
     experiment_id: str = ""
+    debate: dict[str, Any] | None = None  # debate summary (aqe_debate backend); display only
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -59,6 +60,7 @@ class AnalysisReport:
                 for h in self.horizons
             ],
             "unverified": self.unverified,
+            "debate": self.debate,
         }
 
 
@@ -130,6 +132,8 @@ def render_markdown(r: AnalysisReport) -> str:
             L.append(f"- 누락·비가용 소스: {', '.join(f'{k}={c.coverage[k]}' for k in missing)}")
         L.append(f"- 사용량: 호출 {c.usage.llm_calls}, 토큰 {c.usage.prompt_tokens}/{c.usage.completion_tokens}, 비용 {c.usage.cost_estimate_usd if c.usage.cost_estimate_usd is not None else 'unknown'} ({c.usage.cost_basis})")
     L.append("")
+    if r.debate:
+        L.extend(render_debate(r.debate))
     L.append("## 4. 위험 판정 (독립 규칙, LLM이 변경 불가)")
     for h in r.horizons:
         d = h.risk
@@ -155,3 +159,41 @@ def write_report(r: AnalysisReport, out_dir: Path) -> tuple[Path, Path]:
     atomic_write_json(jp, r.to_json())
     atomic_write_text(mp, render_markdown(r))
     return jp, mp
+
+
+def render_debate(d: dict[str, Any]) -> list[str]:
+    """Hypotheses from the analysis/debate layer. LLM wording only — numeric probabilities and risk results above are unchanged."""
+    L = ["", "## 3b. 분석·토론 가설 (연구용; 수치 확률·위험 판정을 바꾸지 않음)",
+         f"- 토론 `{d.get('debate_id')}` · 상태 `{d.get('status')}` · LLM 호출 {d.get('llm_calls')}/{d.get('max_llm_calls')} · "
+         f"제공자 `{d.get('provider')}` 모델 `{d.get('model_id')}` · 이력 반영 `{d.get('applied_to_ledger')}` {d.get('ledger_note') or ''}"]
+    for role, st in (d.get("roles") or {}).items():
+        note = (d.get("role_notes") or {}).get(role, "")
+        L.append(f"- 역할 {role}: `{st}`" + (f" — {note}" if st != "ACTIVE" else ""))
+    if d.get("critique_issues") is not None:
+        L.append(f"- 비판 지적 {d['critique_issues']}건 (MAJOR {d.get('critique_major', 0)}), 재검토 역할: {d.get('revision_role') or '없음'}")
+    for f in (d.get("check_failures") or [])[:5]:
+        L.append(f"- 코드 검사 실패: {f}")
+    for hz in d.get("horizons") or []:
+        h = hz["horizon_seconds"]
+        L.append(f"### 기간 {h // 3600}h")
+        if hz.get("primary") is None:
+            L.append(f"- 주 가설 없음(ABSTAIN): {hz.get('abstain_reason')}")
+        for label, hyp in [("주 가설", hz.get("primary")), *[("반대 가설", o) for o in hz.get("opposing") or []]]:
+            if not hyp:
+                continue
+            state = (d.get("states") or {}).get(hyp.get("canonical_id") or "", "?")
+            L.append(f"- {label} `{hyp.get('canonical_id')}` [{hyp['thesis_type']}/{hyp['direction']}, 상태 {state}, "
+                     f"정성적 확신 {hyp.get('qualitative_confidence') or '—'}]: {hyp['statement']} (근거 {', '.join(hyp['evidence_ids'])})")
+            L.append(f"  - 철회 조건: {'; '.join(hyp['invalidation_conditions'])}")
+            if hyp.get("review_conditions"):
+                L.append(f"  - 재검토 조건: {'; '.join(hyp['review_conditions'])}")
+        for u in hz.get("unresolved") or []:
+            L.append(f"- 미해결: {u}")
+        if hz.get("changed_since_previous"):
+            L.append(f"- 이전 대비 변화: {hz['changed_since_previous']}")
+    for pdc in d.get("prior_decisions") or []:
+        L.append(f"- 이전 가설 `{pdc['hypothesis_id']}` → {pdc['decision']}: {pdc['reason']}")
+    for lim in d.get("limitations") or []:
+        L.append(f"- 한계: {lim}")
+    L.append("")
+    return L

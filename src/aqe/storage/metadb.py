@@ -154,6 +154,15 @@ class JobQueue:
             r = c.execute("SELECT * FROM context_jobs WHERE job_id=?", (job_id,)).fetchone()
             return dict(r) if r else None
 
+    def supersede_pending(self, instrument_id: str, backend: str, newer_as_of, keep_job_id: str) -> int:
+        """Coalesce: older PENDING jobs of the same instrument/backend are superseded by a newer as_of
+        (a late, stale analysis must not overwrite a newer conclusion). Leased jobs are left alone."""
+        with connect(self.path) as c:
+            cur = c.execute("UPDATE context_jobs SET status='SUPERSEDED', updated_at=?, error=? WHERE status='PENDING' "
+                            "AND instrument_id=? AND backend=? AND as_of < ? AND job_id <> ?",
+                            (iso_utc(utc_now()), f"superseded by {keep_job_id}", instrument_id, backend, iso_utc(newer_as_of), keep_job_id))
+            return cur.rowcount
+
     def counts(self) -> dict[str, int]:
         with connect(self.path) as c:
             return {r["status"]: r["n"] for r in c.execute("SELECT status, count(*) n FROM context_jobs GROUP BY status")}

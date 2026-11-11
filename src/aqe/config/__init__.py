@@ -86,8 +86,15 @@ class TradingAgentsConfig(_Cfg):
     max_risk_discuss_rounds: int = 1
 
 
+class DebateConfig(_Cfg):
+    """Analysis/debate layer (backend `aqe_debate`): specialists -> critic -> one revision -> synthesis."""
+
+    max_llm_calls: int = 8  # 4 specialists + critic + 1 revision + synthesis + 1 format-only repair
+    roles: list[str] = Field(default_factory=lambda: ["CHART", "FLOW", "NEWS", "CROSS_MARKET"])
+
+
 class ContextConfig(_Cfg):
-    backend: str = "none"  # none | offline_fixture | simple_llm | tradingagents
+    backend: str = "none"  # none | offline_fixture | simple_llm | tradingagents | aqe_debate
     ttl_seconds: int = 1800
     lease_seconds: int = 900
     job_timeout_seconds: int = 600
@@ -99,6 +106,7 @@ class ContextConfig(_Cfg):
     evidence_root: str = "evidence"
     llm: LLMConfig = LLMConfig()
     tradingagents: TradingAgentsConfig = TradingAgentsConfig()
+    debate: DebateConfig = DebateConfig()
 
 
 class AnalysisConfig(_Cfg):

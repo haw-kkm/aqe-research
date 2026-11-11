@@ -36,15 +36,18 @@ def enqueue_for_asof(cfg: LocalConfig, rec: RunRecord, as_of: datetime | None, r
             as_of = (bars["close_time"].max() + pd.Timedelta(seconds=cfg.analysis.decision_delay_seconds)).to_pydatetime()
         else:
             as_of = utc_now()
-    bundle = build_bundle(cfg, inst, as_of)
+    bundle = build_bundle(cfg, inst, as_of, include_numeric=cfg.context.backend == "aqe_debate")
     save_bundle(cfg.paths.data_root, bundle)
     llm = cfg.context.llm
     key = context_cache_key(instrument_slug=inst.slug(), as_of=as_of, bundle_hash=bundle.bundle_hash, backend=cfg.context.backend,
                             upstream_ref=cfg.context.tradingagents.upstream_sha if cfg.context.backend == "tradingagents" else None,
                             provider=llm.provider, model_id=llm.model_id, prompt_h=prompt_hash(cfg.context.backend),
                             config_h=config_hash(cfg.context), run_id=run_id, portfolio_hash=None)
-    job = _queue(cfg).enqueue(key, inst.instrument_id, as_of, bundle.bundle_id, cfg.context.backend)
+    q = _queue(cfg)
+    job = q.enqueue(key, inst.instrument_id, as_of, bundle.bundle_id, cfg.context.backend)
+    superseded = q.supersede_pending(inst.instrument_id, cfg.context.backend, as_of, job["job_id"])
     rec.outputs.update({"job_id": job["job_id"], "job_status": job["status"], "bundle_id": bundle.bundle_id,
+                        "superseded_older_pending": superseded,
                         "bundle_items": len(bundle.items), "source_health": {h.source_kind.value: h.status.value for h in bundle.source_health},
                         "as_of": iso_utc(as_of)})
     return EXIT_OK

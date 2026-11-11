@@ -76,6 +76,11 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
 
     context = latest_assessment(cfg.paths.data_root, inst, as_of, decision_time,
                                 replay=(mode == RuntimeMode.REPLAY), backend=cfg.context.backend)
+    debate_summary = None
+    if context is not None and context.backend == "aqe_debate":
+        from aqe.context.debate import debate_summary as _ds
+
+        debate_summary = _ds(cfg.paths.data_root, inst, context.assessment_id, as_of)
     portfolio = None
     if cfg.analysis.portfolio_snapshot is not None and cfg.analysis.portfolio_snapshot.exists():
         portfolio = PortfolioSnapshot.model_validate(read_json(cfg.analysis.portfolio_snapshot))
@@ -116,7 +121,7 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
     report = AnalysisReport(
         analysis_id=analysis_id, mode=mode.value, generated_at=utc_now(), decision_time=decision_time,
         snapshot=snapshot, horizons=horizons, context=context, data_quality=dq, unverified=unverified,
-        config_hash=cfg_hash, experiment_id=exp.experiment_id,
+        config_hash=cfg_hash, experiment_id=exp.experiment_id, debate=debate_summary,
     )
     out_dir = cfg.paths.data_root / "reports"
     jp, mp = write_report(report, out_dir)
@@ -152,7 +157,7 @@ def run_report(cfg: LocalConfig, rec: RunRecord, analysis_id: str | None) -> int
                   for h in d["horizons"]],
         context=ContextAssessment.model_validate(d["context"]) if d.get("context") else None,
         data_quality=d["data_quality"], unverified=d.get("unverified", []), config_hash=d.get("config_hash", ""),
-        experiment_id=d.get("experiment_id", ""),
+        experiment_id=d.get("experiment_id", ""), debate=d.get("debate"),
     )
     mp = Path(str(jp)[:-5] + ".md")
     atomic_write_text(mp, render_markdown(rep))

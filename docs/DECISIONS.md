@@ -68,3 +68,15 @@
   no LLM provider configured). A `numeric_context` meta/calibrator is therefore not trained; context is shown in
   reports but never combined into probabilities (T10). E4/E5 are BLOCKED until context assessments accumulate
   forward in shadow mode.
+
+## ADR-0011 — Analysis/debate layer as a separate LangGraph graph (debate proposal v0.1)
+- Context: the proposal asks for specialists → critic → one revision → synthesis → code checks → hypothesis history,
+  reusing the existing TradingAgents integration where possible. The pinned TradingAgents graph (analysts → Bull/Bear →
+  research manager → trader → risk debate → PM) has no critic/revision/hypothesis-lifecycle nodes and a different role set.
+- Decision: keep the upstream graph untouched as backend `tradingagents` (E5). Add backend `aqe_debate`: a small
+  LangGraph StateGraph in the worker venv (`src/aqe/context/debate_worker.py`) reusing LangGraph, TradingAgents'
+  `create_llm_client` factory and the ta_bridge isolation/budget helpers. Core (`src/aqe/context/debate.py`) builds
+  prompts and role evidence slices, runs code checks, maintains the append-only hypothesis ledger and projects the
+  synthesis onto ContextAssessment. This is "role ideas + LangGraph + LLM factory reused", not "full TradingAgents integration".
+- Limits: max 8 LLM calls per job; roles without verified evidence are NOT_ACTIVATED; the layer never writes
+  probabilities, never sets contextual_rating, cannot lift risk restrictions; real-LLM runs follow ADR-0008.
