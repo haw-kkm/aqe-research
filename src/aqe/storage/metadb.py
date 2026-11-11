@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -138,6 +139,30 @@ class JobQueue:
             cur = c.execute("UPDATE context_jobs SET status='DONE', result_assessment_id=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL WHERE job_id=? AND lease_owner=? AND status='LEASED'",
                             (assessment_id, iso_utc(utc_now()), job_id, owner))
             return cur.rowcount == 1
+
+    def complete_with(self, job_id: str, owner: str, assessment_id: str, on_commit: Callable[[], Any]) -> tuple[bool, Any]:
+        """Two-phase completion: under the queue's write lock, verify that `owner` still holds the lease, run
+        `on_commit` (a side effect such as a hypothesis-ledger append), then mark the job DONE — one transaction.
+        A worker that lost its lease gets (False, None) and `on_commit` never runs. If `on_commit` raises, the job
+        is not completed (still LEASED by `owner`) and the exception propagates. While the lock is held no other
+        worker can lease the job, so the lease cannot be lost between the check and the side effect."""
+        with connect(self.path) as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                held = c.execute("SELECT 1 FROM context_jobs WHERE job_id=? AND lease_owner=? AND status='LEASED'",
+                                 (job_id, owner)).fetchone()
+                if held is None:
+                    c.execute("ROLLBACK")
+                    return False, None
+                out = on_commit()
+                c.execute("UPDATE context_jobs SET status='DONE', result_assessment_id=?, updated_at=?, lease_owner=NULL, "
+                          "lease_expires_at=NULL WHERE job_id=?", (assessment_id, iso_utc(utc_now()), job_id))
+                c.execute("COMMIT")
+                return True, out
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
 
     def fail(self, job_id: str, owner: str, error: str, terminal_status: str = "FAILED") -> str | None:
         with connect(self.path) as c:

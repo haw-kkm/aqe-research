@@ -80,3 +80,28 @@
   synthesis onto ContextAssessment. This is "role ideas + LangGraph + LLM factory reused", not "full TradingAgents integration".
 - Limits: max 8 LLM calls per job; roles without verified evidence are NOT_ACTIVATED; the layer never writes
   probabilities, never sets contextual_rating, cannot lift risk restrictions; real-LLM runs follow ADR-0008.
+
+## ADR-0012 — Hypothesis ledger: plan → commit under lease and version checks (debate review 2026-11-12, D01–D05)
+- Context: `aqe_debate` appended ledger rows inside `assess`, using the ledger read BEFORE the LLM run and BEFORE the
+  worker checked its lease. A slow run could re-activate a hypothesis that a newer run had invalidated (D01); a worker
+  that had lost its lease still wrote rows (D02). REVISE could link different horizons (D03), duplicate hypothesis ids
+  were remapped across horizons (D04), and parallel drafts all passed the call cap on the same state snapshot (D05).
+- Decision (two phases): `assess` only PLANS rows (`plan_ledger`, pure) and returns a candidate assessment; the rows
+  change the ledger only in `DebateBackend.commit` → `commit_ledger`, which takes a per-instrument ledger lock (SQLite
+  write lock next to the JSONL) and re-reads the ledger, refusing when (a) rows of the same job already exist (retry),
+  (b) the ledger holds a newer as_of (late result), (c) the ledger version (row count + last record id) differs from
+  the one the debate read (conflict). In the worker path `commit` runs inside `JobQueue.complete_with`: the lease is
+  verified, the ledger is committed and the job is marked DONE in one queue transaction (lock order queue → ledger),
+  after the common `validate_against_bundle`. `states_at` orders by as_of, not by file position (defence in depth).
+- Refused results: the DebateRecord stays as an audit record (`applied_to_ledger=false` + reason); the assessment
+  carries `hypothesis ledger: <note>` and its claims do not show canonical ids that were never written. A conflicting
+  run is not retried automatically — the next enqueue runs on the current ledger.
+- Crash windows: crash before the queue COMMIT → job stays LEASED, lease expires, job re-runs; rows the job already
+  appended (tagged `job_id`) are not applied twice. Crash after the queue COMMIT but before the assessment/record save →
+  job DONE and ledger applied, record still says "pending commit" (rows traceable via debate_id/job_id). A torn final
+  JSONL line fails closed on load (manual inspection; never skipped silently).
+- Identity: synthesis hypothesis ids must be unique and must not reuse prior ids; one decision per prior; a REVISE
+  replacement must have the prior's instrument and horizon (another horizon is a new question). `DebateRecord.
+  hypothesis_id_map` is the single LLM-id → canonical-id map used by ledger rows, projected claims and the report.
+- Call cap: the worker takes a slot from one lock-protected counter before every model invocation (never refunded,
+  failed calls included); core refuses before reserving budget when `max_llm_calls < active roles + 2`.

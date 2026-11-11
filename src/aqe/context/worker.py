@@ -68,7 +68,16 @@ def process_one(cfg: LocalConfig, queue: JobQueue, backend, owner: str) -> dict 
     a = validate_against_bundle(a, bundle)
     staging = assessments_dir(cfg.paths.data_root, bundle.instruments[0]).parent / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
-    if queue.complete(job["job_id"], owner, a.assessment_id):
+    commit = getattr(backend, "commit", None)  # two-phase backends (aqe_debate): side effects only while the lease is held
+    if commit is not None:
+        try:
+            held, a = commit(a, job, owner, queue)
+        except Exception as exc:  # noqa: BLE001 - nothing completed; the job is retried or failed, never half-done
+            queue.fail(job["job_id"], owner, f"commit error {type(exc).__name__}: {exc}")
+            return {"job_id": job["job_id"], "result": f"commit failed: {type(exc).__name__}: {exc}"[:300]}
+    else:
+        held = queue.complete(job["job_id"], owner, a.assessment_id)
+    if held:
         p = save_assessment(cfg.paths.data_root, a)
         return {"job_id": job["job_id"], "assessment_id": a.assessment_id, "status": a.status.value,
                 "temporal_scope": a.temporal_scope.value, "path": str(p)}

@@ -1,6 +1,6 @@
 # 분석·토론 계층 — 구조안 v0.1 대비 구현 상태
 
-기준: `AQE_Agent_Debate_Structure_KO_v0_1.md`(2026-11-11). 개발 브랜치 `dev/debate-layer`(worktree `C:\vscode\aqe-dev`).
+기준: `AQE_Agent_Debate_Structure_KO_v0_1.md`(2026-11-11). 개발 브랜치 `dev/debate-layer-update`(worktree `C:\vscode\aqe-dev`; 커밋 0f5d4f0 + §4 검토 반영 미커밋).
 구분: **대체 LLM 시험**(scripted, 배선 검증) / **실제 LLM 호출**(미실행) / **실제 시장 자료 연결** / **분석 성능 검증**(미실행)은 서로 다른 증거다.
 
 ## 1. 기존 구현과의 관계 (중복 없음)
@@ -27,11 +27,11 @@
 | §6-4 비판 | 근거 연결·범위·중복·기간 혼합·시간 위반·주체 의도 단정 검사, 반대 강요 없음, 재검토 역할 최대 1개 | 구현 |
 | §6-5 제한된 보완 | 지정 역할 1회 재검토(예산 2회 이상 남을 때만) | 구현 |
 | §6-6 종합 | 다수결·확신 평균 금지 지시, 기간별 주/반대 가설·미해결, 이전 가설 KEEP/REVISE/INVALIDATE | 구현 |
-| §6-7 기계 검사 | 근거 ID ⊂ 묶음, 역할/회차 일치, 기간 ⊂ 설정, 누락 기간 → ABSTAIN, INVALIDATE는 근거 필수, REVISE는 대체 가설 필수 | 구현·시험 |
-| §6-8 저장 | `context/debates/<inst>/<assessment>.debate.json`, 가설 이력 `context/hypotheses/<inst>.jsonl`(append-only) | 구현 |
-| 호출 상한 8 | worker가 매 호출 전 검사 + 실제 LLM 모드에서 usage callback 상한·프롬프트 상한·재시도 0, 비용 예약 = 8회분 | 구현(대체 LLM으로 시험) |
-| §7 가설 상태 | ACTIVE / REVISED / INVALIDATED / EXPIRED(코드가 시간으로 판정) / ABSTAIN; 이전 판단 연결(previous_id) | 구현·시험 |
-| 늦게 도착한 분석 | 이력의 최신 as_of보다 오래된 토론은 이력에 반영하지 않음; 대기 중 오래된 job은 SUPERSEDED | 구현·시험 |
+| §6-7 기계 검사 | 근거 ID ⊂ 묶음, 역할/회차 일치, 기간 ⊂ 설정, 누락 기간 → ABSTAIN, INVALIDATE는 근거 필수, REVISE는 대체 가설 필수 + **상품·기간 일치**, 종합 가설 ID **유일**·이전 ID 재사용 금지·이전 가설당 판정 1개 | 구현·시험 |
+| §6-8 저장 | `context/debates/<inst>/<assessment>.debate.json`(감사 기록, 미반영도 보존), 가설 이력 `context/hypotheses/<inst>.jsonl`(append-only, 행마다 `job_id`) | 구현 |
+| 호출 상한 8 | worker가 **공유 카운터에서 호출 전 슬롯을 원자적으로 확보**(실패해도 반환 안 함) + 실제 LLM 모드에서 usage callback 상한·프롬프트 상한·재시도 0, 비용 예약 = 8회분; core는 `상한 < 활성 역할 + 2`이면 실행 전 거부 | 구현(대체 LLM으로 시험) |
+| §7 가설 상태 | ACTIVE / REVISED / INVALIDATED / EXPIRED(코드가 시간으로 판정) / ABSTAIN; 이전 판단 연결(previous_id); 시점 조회는 **as_of 순서** | 구현·시험 |
+| 늦게 도착한 분석 | **확정 단계(commit)**에서 원장을 다시 읽어 최신 as_of보다 오래되었거나 원장 버전이 바뀌었으면 반영 거부; worker 경로에서는 lease 확인·원장 반영·job 완료가 한 큐 트랜잭션(ADR-0012); 대기 중 오래된 job은 SUPERSEDED | 구현·시험 |
 | 수치 확률·LLM 확신 분리 | 토론은 확률을 쓰지 않고 `contextual_rating=None`; 위험 판정 불변 | 구현·시험 |
 | 보고서 | `analyze` 보고서에 "3b. 분석·토론 가설"(주/반대 가설, 철회 조건, 상태, 역할 활성, 비판 수) | 구현 |
 | §9 평가(탐지·철회·예측 채점) | — | 미구현(다음 단계) |
@@ -48,3 +48,14 @@
 .venv\Scripts\aqe analyze --config configs\<dev>.yaml           # 보고서 3b 섹션
 ```
 `offline_scripted` 결과는 분석에 사용되지 않는다(`latest_assessment`가 제외). 실제 LLM은 비용 예약 규칙(ADR-0008/보완 A)을 그대로 따른다.
+직접 호출(시험 등)에서는 `a = backend.assess(...)` 뒤 `held, a = backend.commit(a)`를 불러야 가설 이력에 반영된다(assess는 계획만 한다).
+
+## 4. 독립 검토(2026-11-12, 검토 커밋 0f5d4f0) 반영
+| ID | 문제 | 수정 | 회귀 시험 |
+|---|---|---|---|
+| D01 | 늦게 끝난 분석이 철회된 가설을 ACTIVE로 되돌림 | assess는 행을 **계획**만, `commit_ledger`가 잠금 아래 원장을 다시 읽어 늦은 결과·버전 변경을 거부; `states_at`은 as_of 순서 | `test_d01_*`(늦은 as_of / 같은 as_of 충돌), `test_states_at_orders_by_as_of_not_file_position` |
+| D02 | lease를 잃은 worker도 원장에 기록 | `process_one` → `backend.commit` → `JobQueue.complete_with`: lease 확인·원장 반영·DONE이 한 트랜잭션; 확정 오류 시 job 재시도 가능 상태; 같은 job 재반영 금지 | `test_d02_*` 4개 |
+| D03 | 1h 가설을 24h 가설로 REVISE 허용 | 대체 가설의 상품·기간이 이전 가설과 같아야 함 | `test_d03_*` |
+| D04 | 종합 가설 ID 중복 → 다른 기간의 canonical ID 표기 | ID 유일·이전 ID 재사용 금지·판정 중복 금지; 계획 단계도 중복이면 예외; `hypothesis_id_map` 하나로 원장·주장·보고서 연결 | `test_d04_*` |
+| D05 | 병렬 초안이 같은 상태로 상한 검사(4역할·상한 3 → 4회) | 공유 슬롯 카운터(lock) + core 사전 거부 | `test_d05_*`(4역할 × 상한 0/1/3/8 × 일반/재검토+형식보완/공급자 오류) |
+설계 결정과 crash 시 동작은 `docs/DECISIONS.md` ADR-0012.

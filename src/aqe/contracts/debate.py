@@ -172,6 +172,7 @@ class HypothesisRecord(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     hypothesis: Hypothesis | None = None
     position: str = "primary"  # primary | opposing (alternative hypothesis kept for the same horizon)
+    job_id: str | None = None  # queue job whose commit wrote this row (a retried job is never applied twice)
 
 
 class DebateRecord(StrictModel):
@@ -200,3 +201,5 @@ class DebateRecord(StrictModel):
     status: str = "OK"  # OK | PARTIAL | INVALID | MISSING | TIMEOUT
     applied_to_ledger: bool = False
     ledger_note: str = ""
+    ledger_base_version: str | None = None  # ledger version the debate's priors were read from (commit checks it)
+    hypothesis_id_map: dict[str, str] = Field(default_factory=dict)  # LLM id -> canonical ledger id (only when applied)

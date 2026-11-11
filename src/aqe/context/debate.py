@@ -2,8 +2,9 @@
 
 Implements the vertical path of the debate proposal v0.1 (§3, §5–§7, §10 steps 1–2, §12):
   EvidenceBundle (+ AQE numeric estimates) -> role slices / activation -> worker graph (.venv-ta) ->
-  code checks (contracts, evidence ids, horizons, lineage) -> append-only hypothesis ledger ->
-  DebateRecord + projection onto the existing ContextAssessment contract.
+  code checks (contracts, evidence ids, horizons, lineage, id uniqueness) -> planned ledger rows ->
+  DebateRecord + projection onto the existing ContextAssessment contract -> commit: append-only hypothesis ledger,
+  applied only while the job lease is held and the ledger is unchanged since the debate read it (ADR-0012).
 
 Roles without their required evidence are NOT_ACTIVATED (reduced scope, never "no event").
 LLM output never changes numeric probabilities or risk restrictions; LLM confidence is wording only.
@@ -13,9 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sqlite3
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -229,19 +235,48 @@ def load_ledger(data_root: Path, inst: InstrumentKey) -> list[HypothesisRecord]:
 
 
 def append_ledger(data_root: Path, inst: InstrumentKey, rows: list[HypothesisRecord]) -> None:
+    """Append rows in one write + fsync. Callers that change the active ledger go through commit_ledger (lock + checks)."""
+    if not rows:
+        return
     p = ledger_path(data_root, inst)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as fh:
-        for r in rows:
-            fh.write(r.model_dump_json() + "\n")
+        fh.write("".join(r.model_dump_json() + "\n" for r in rows))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def ledger_version(records: list[HypothesisRecord]) -> str:
+    """Identity of an append-only ledger state: row count + last record id."""
+    return f"{len(records)}:{records[-1].record_id}" if records else "0:"
+
+
+@contextmanager
+def ledger_lock(data_root: Path, inst: InstrumentKey, timeout: float = 30.0) -> Iterator[None]:
+    """Cross-process mutex for one instrument's ledger (SQLite write lock; works on Windows and POSIX)."""
+    p = ledger_path(data_root, inst)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(p.with_name(p.stem + ".lock.sqlite")), timeout=timeout, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        con.close()
 
 
 def states_at(records: list[HypothesisRecord], as_of: datetime) -> dict[str, HypothesisRecord]:
-    """Latest record per hypothesis among rows whose as_of <= as_of (point-in-time view)."""
+    """Point-in-time view: per hypothesis, the row with the latest as_of <= as_of (ties: later file row).
+
+    Ordered by as_of, not by file position, so a row appended late for an OLDER as_of can never override a newer
+    decision (defence in depth — commit_ledger already refuses late or conflicting results)."""
     cur: dict[str, HypothesisRecord] = {}
     for r in records:
         if r.as_of <= as_of:
-            cur[r.hypothesis_id] = r
+            prev = cur.get(r.hypothesis_id)
+            if prev is None or r.as_of >= prev.as_of:
+                cur[r.hypothesis_id] = r
     return cur
 
 
@@ -323,7 +358,7 @@ def check_debate(res: dict, bundle: EvidenceBundle, active: list[AnalystRole], h
             revision = _check_report(rv["parsed"], critique.revision_role, 1, valid, horizons, failures)
     synthesis = None
     s = (res.get("synthesis") or {}).get("parsed")
-    prior_ids = {r.hypothesis_id for r in priors}
+    prior_by_id = {r.hypothesis_id: r for r in priors}
     if s is not None:
         try:
             synthesis = SynthesisReport.model_validate(s)
@@ -337,22 +372,50 @@ def check_debate(res: dict, bundle: EvidenceBundle, active: list[AnalystRole], h
         if sorted(seen) != sorted(set(seen)) or any(h not in horizons for h in seen):
             failures.append(f"synthesis: horizons {seen} must be unique and within {horizons}")
             ok = False
-        new_ids = set()
+        # identity contract: every new hypothesis has its own id (ledger, projection and report all key on it)
+        new_hz: dict[str, int] = {}
+        dup: set[str] = set()
         for hz in synthesis.horizons:
             for hyp in (hz.primary, *hz.opposing):
                 if hyp is None:
                     continue
                 ok &= _ids_ok(hyp.evidence_ids, valid, f"synthesis:{hyp.hypothesis_id}", failures)
-                new_ids.add(hyp.hypothesis_id)
+                if hyp.hypothesis_id in new_hz:
+                    dup.add(hyp.hypothesis_id)
+                new_hz[hyp.hypothesis_id] = hz.horizon_seconds
+        if dup:
+            failures.append(f"synthesis: duplicate hypothesis ids {sorted(dup)[:5]} — each hypothesis needs its own id")
+            ok = False
+        reused = sorted(set(new_hz) & set(prior_by_id))
+        if reused:
+            failures.append(f"synthesis: new hypotheses reuse prior ids {reused[:5]} — priors are referenced only via prior_decisions")
+            ok = False
+        decided = [d.hypothesis_id for d in synthesis.prior_decisions]
+        if len(decided) != len(set(decided)):
+            failures.append("synthesis: more than one decision for the same prior hypothesis")
+            ok = False
+        repl = [d.replacement_id for d in synthesis.prior_decisions if d.decision == PriorDecisionType.REVISE and d.replacement_id]
+        if len(repl) != len(set(repl)):
+            failures.append("synthesis: one replacement hypothesis is named by several REVISE decisions")
+            ok = False
+        inst = bundle.instruments[0]
         for dcs in synthesis.prior_decisions:
-            if dcs.hypothesis_id not in prior_ids:
+            prior = prior_by_id.get(dcs.hypothesis_id)
+            if prior is None:
                 failures.append(f"synthesis: decision on unknown prior {dcs.hypothesis_id}")
                 ok = False
             if dcs.decision == PriorDecisionType.INVALIDATE and not _ids_ok(dcs.evidence_ids, valid, f"invalidate:{dcs.hypothesis_id}", failures):
                 ok = False
-            if dcs.decision == PriorDecisionType.REVISE and dcs.replacement_id not in new_ids:
-                failures.append(f"synthesis: REVISE of {dcs.hypothesis_id} without a replacement hypothesis in this run")
-                ok = False
+            if dcs.decision == PriorDecisionType.REVISE:
+                if dcs.replacement_id not in new_hz:
+                    failures.append(f"synthesis: REVISE of {dcs.hypothesis_id} without a replacement hypothesis in this run")
+                    ok = False
+                elif prior is not None and (prior.instrument != inst or prior.horizon_seconds != new_hz[dcs.replacement_id]):
+                    # a forecast for another horizon/instrument is a different question, not a revision of this one
+                    failures.append(f"synthesis: REVISE of {dcs.hypothesis_id} ({prior.instrument.instrument_id}, {prior.horizon_seconds}s) "
+                                    f"names replacement {dcs.replacement_id} ({inst.instrument_id}, {new_hz[dcs.replacement_id]}s) — "
+                                    "instrument and horizon must match")
+                    ok = False
         missing_h = [h for h in horizons if h not in seen]
         if ok and missing_h:
             failures.append(f"synthesis: no answer for horizons {missing_h} (recorded as ABSTAIN)")
@@ -365,28 +428,48 @@ def check_debate(res: dict, bundle: EvidenceBundle, active: list[AnalystRole], h
             "failures": failures, "role_status": role_status, "status": status}
 
 
-# ---------------------------------------------------------------- ledger application
-def apply_to_ledger(data_root: Path, inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis: SynthesisReport | None,
-                    records: list[HypothesisRecord]) -> tuple[list[HypothesisRecord], bool, str, dict[str, str]]:
-    """Returns (rows appended, applied?, note, id_map llm-id -> canonical id). Older-than-latest debates are not applied."""
+# ---------------------------------------------------------------- ledger application (plan -> locked commit)
+# Two phases (review D01/D02): the debate PLANS its rows from the ledger state it read before the LLM run; the rows
+# change the active ledger only in commit_ledger, which re-reads the ledger under a lock and refuses the plan if the
+# ledger moved on (newer as_of = late result; same as_of but other rows = conflict) or if this job was already applied.
+# The worker path runs commit_ledger inside JobQueue.complete_with, so a worker that lost its lease never writes.
+@dataclass
+class LedgerPlan:
+    instrument: InstrumentKey
+    debate_id: str
+    as_of: datetime
+    base_version: str
+    rows: list[HypothesisRecord] = field(default_factory=list)
+    id_map: dict[str, str] = field(default_factory=dict)  # LLM hypothesis id -> canonical ledger id
+    job_id: str | None = None
+    note: str = "applied"
+    applicable: bool = True
+
+
+def plan_ledger(inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis: SynthesisReport | None,
+                records: list[HypothesisRecord], job_id: str | None = None) -> LedgerPlan:
+    """Pure: the rows this debate would append on top of `records` (no I/O)."""
     now = utc_now()
+    plan = LedgerPlan(instrument=inst, debate_id=debate_id, as_of=as_of, base_version=ledger_version(records), job_id=job_id)
     latest = max((r.as_of for r in records), default=None)
     if latest is not None and as_of < latest:
-        return [], False, f"late arrival: as_of {iso_utc(as_of)} is older than ledger state {iso_utc(latest)}; not applied", {}
-    rows: list[HypothesisRecord] = []
+        plan.applicable = False
+        plan.note = f"late arrival: as_of {iso_utc(as_of)} is older than ledger state {iso_utc(latest)}; not applied"
+        return plan
+    rows, id_map = plan.rows, plan.id_map
 
     def row(hid, h, state, reason, valid_until, hyp=None, prev=None, ev=(), position="primary"):
         rows.append(HypothesisRecord(record_id=f"hr-{uuid.uuid4().hex[:12]}", hypothesis_id=hid, instrument=inst, horizon_seconds=h,
                                      state=state, reason=reason, debate_id=debate_id, as_of=as_of, recorded_at=now,
-                                     valid_until=valid_until, previous_id=prev, evidence_ids=tuple(ev), hypothesis=hyp, position=position))
+                                     valid_until=valid_until, previous_id=prev, evidence_ids=tuple(ev), hypothesis=hyp, position=position,
+                                     job_id=job_id))
 
     for r in due_expiries(records, as_of):  # time-based, decided by code, never by the LLM
         row(r.hypothesis_id, r.horizon_seconds, HypothesisState.EXPIRED, "valid_until passed without re-confirmation",
             r.valid_until, r.hypothesis, position=r.position)
-    id_map: dict[str, str] = {}
     if synthesis is None:
-        append_ledger(data_root, inst, rows)
-        return rows, True, "synthesis invalid: only expiries applied", id_map
+        plan.note = "synthesis invalid: only expiries applied"
+        return plan
     short = debate_id.split("-")[-1]
     replaced: dict[str, str] = {}
     priors = {r.hypothesis_id: r for r in active_priors(records, as_of)}
@@ -402,6 +485,8 @@ def apply_to_ledger(data_root: Path, inst: InstrumentKey, debate_id: str, as_of:
             if hyp is None:
                 continue
             cid = f"hyp-{short}-h{h}-{k}"
+            if hyp.hypothesis_id in id_map:  # check_debate refuses this; never silently remap an id to another horizon
+                raise ValueError(f"duplicate hypothesis id {hyp.hypothesis_id!r} in synthesis")
             id_map[hyp.hypothesis_id] = cid
             canon = hyp.model_copy(update={"hypothesis_id": cid})
             row(cid, h, HypothesisState.ACTIVE, f"{pos} hypothesis of debate {debate_id}", valid_until, canon,
@@ -419,8 +504,35 @@ def apply_to_ledger(data_root: Path, inst: InstrumentKey, debate_id: str, as_of:
         else:
             row(p.hypothesis_id, p.horizon_seconds, HypothesisState.INVALIDATED, f"invalidation condition observed: {d.reason}",
                 p.valid_until, p.hypothesis, ev=d.evidence_ids, position=p.position)
-    append_ledger(data_root, inst, rows)
-    return rows, True, "applied", id_map
+    return plan
+
+
+def commit_ledger(data_root: Path, plan: LedgerPlan) -> tuple[bool, str]:
+    """Apply a plan under the ledger lock, re-validated against the CURRENT ledger. Returns (applied, note)."""
+    if not plan.applicable:
+        return False, plan.note
+    with ledger_lock(data_root, plan.instrument):
+        current = load_ledger(data_root, plan.instrument)
+        if plan.job_id and any(r.job_id == plan.job_id for r in current):
+            return False, f"job {plan.job_id} was already applied by an earlier attempt; not applied twice"
+        latest = max((r.as_of for r in current), default=None)
+        if latest is not None and plan.as_of < latest:
+            return False, (f"late arrival: as_of {iso_utc(plan.as_of)} is older than ledger state {iso_utc(latest)} "
+                           "(written while this debate ran); not applied")
+        now_version = ledger_version(current)
+        if now_version != plan.base_version:
+            return False, (f"ledger changed while this debate ran (read {plan.base_version}, now {now_version}); its prior "
+                           "decisions refer to a stale state — not applied, re-run on the current ledger")
+        append_ledger(data_root, plan.instrument, plan.rows)
+    return True, plan.note
+
+
+def apply_to_ledger(data_root: Path, inst: InstrumentKey, debate_id: str, as_of: datetime, synthesis: SynthesisReport | None,
+                    records: list[HypothesisRecord], job_id: str | None = None) -> tuple[list[HypothesisRecord], bool, str, dict[str, str]]:
+    """plan + commit (no queue lease involved). Returns (rows appended, applied?, note, id_map llm-id -> canonical id)."""
+    plan = plan_ledger(inst, debate_id, as_of, synthesis, records, job_id)
+    applied, note = commit_ledger(data_root, plan)
+    return (plan.rows, True, note, plan.id_map) if applied else ([], False, note, {})
 
 
 # ---------------------------------------------------------------- projection onto ContextAssessment
@@ -467,8 +579,20 @@ def load_debate(data_root: Path, inst: InstrumentKey, assessment_id: str) -> Deb
     return DebateRecord.model_validate_json(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
+@dataclass
+class _PendingCommit:
+    plan: LedgerPlan
+    checked: dict[str, Any]
+    status: ContextStatus  # candidate status before the common validation
+
+
 class DebateBackend:
-    """Specialists -> critic -> one revision -> synthesis in the worker venv; code checks + ledger here."""
+    """Specialists -> critic -> one revision -> synthesis in the worker venv; code checks + ledger here.
+
+    Two-phase: `assess` returns a CANDIDATE assessment and only plans its hypothesis-ledger rows; `commit` applies
+    them (worker path: inside JobQueue.complete_with, i.e. only while the lease is still held, after the common
+    validation, against the current ledger version). Direct callers without a queue job call `commit(a)`.
+    """
 
     name = "aqe_debate"
 
@@ -477,6 +601,7 @@ class DebateBackend:
         self.root = project_root or Path(__file__).resolve().parents[3]
         self.horizons = horizons
         self._reservation: tuple[float, bool, int] | None = None
+        self._pending: dict[str, _PendingCommit] = {}
 
     def _horizons(self) -> list[int]:
         if self.horizons:
@@ -514,6 +639,11 @@ class DebateBackend:
         not_active = "; ".join(f"{r.value}: {notes[r]}" for r in AnalystRole if status[r] != RoleStatus.ACTIVE)
         if not active:
             return missing(bundle, self.name, ContextStatus.MISSING, f"no analyst role has its required evidence ({not_active})", cfg.context.ttl_seconds, **common)
+        min_calls = len(active) + 2  # one draft per active role + critic + synthesis
+        if dcfg.max_llm_calls < min_calls:  # refuse before reserving budget or spending any call
+            return missing(bundle, self.name, ContextStatus.UNSUPPORTED,
+                           f"context.debate.max_llm_calls={dcfg.max_llm_calls} is below the minimum {min_calls} for {len(active)} "
+                           "active role(s) (drafts + critic + synthesis); debate not run", cfg.context.ttl_seconds, **common)
         py = self._worker_python()
         if py is None or not py.exists():
             return missing(bundle, self.name, ContextStatus.UNSUPPORTED, "worker venv (.venv-ta) not installed", cfg.context.ttl_seconds, **common)
@@ -550,9 +680,12 @@ class DebateBackend:
             self._settle(None, None)
             return missing(bundle, self.name, ContextStatus.INVALID, f"worker produced no result (rc={proc.returncode}): {proc.stderr[-400:]}", cfg.context.ttl_seconds, **common)
         res = json.loads(outp.read_text(encoding="utf-8"))
-        return self.finish(bundle, res, debate_id, active, status, notes, horizons, priors, records, common, latency, ph)
+        return self.finish(bundle, res, debate_id, active, status, notes, horizons, priors, records, common, latency, ph, job=job)
 
-    def finish(self, bundle, res, debate_id, active, status, notes, horizons, priors, records, common, latency, ph) -> ContextAssessment:
+    def finish(self, bundle, res, debate_id, active, status, notes, horizons, priors, records, common, latency, ph,
+               job: dict[str, Any] | None = None) -> ContextAssessment:
+        """Checks + candidate assessment. `records` is the ledger the debate's priors were read from (before the
+        LLM run); the planned rows are applied only by `commit`, after re-validation against the current ledger."""
         cfg = self.cfg
         inst = bundle.instruments[0]
         audit = res.get("audit", {})
@@ -574,8 +707,8 @@ class DebateBackend:
                         calls, ph, False, "worker failed")
             return a
         checked = check_debate(res, bundle, active, horizons, priors)
-        rows, applied, note, id_map = apply_to_ledger(cfg.paths.data_root, inst, debate_id, bundle.as_of, checked["synthesis"], records)
-        claims, counter, review = project(checked, id_map)
+        plan = plan_ledger(inst, debate_id, bundle.as_of, checked["synthesis"], records, job_id=(job or {}).get("job_id"))
+        claims, counter, review = project(checked, plan.id_map)
         clean = not audit.get("network_denied") and not audit.get("guard_violations") and not audit.get("proxy_env") and not audit.get("budget_abort")
         reasons = [f"debate {debate_id}: roles " + ", ".join(f"{r.value}={checked['role_status'].get(r, status[r]).value}" for r in AnalystRole),
                    "LLM parametric knowledge may post-date as_of; forward validation required",
@@ -584,8 +717,6 @@ class DebateBackend:
         if not_active:
             reasons.append("not activated — " + " | ".join(not_active))
         reasons += [f"check: {f}" for f in checked["failures"][:10]]
-        if not applied:
-            reasons.append(note)
         if not clean:
             reasons.append(f"isolation not proven: network_denied={(audit.get('network_denied') or [])[:5]}, budget_abort={audit.get('budget_abort')}")
         st = {"OK": ContextStatus.OK, "PARTIAL": ContextStatus.PARTIAL, "INVALID": ContextStatus.INVALID}[checked["status"]]
@@ -595,10 +726,53 @@ class DebateBackend:
                               evidence_ids_used=tuple(sorted({i for c in (*claims, *counter) for i in c.evidence_ids})),
                               temporal_scope=TemporalScope.INTRADAY_ASOF_VERIFIED if clean else TemporalScope.UNVERIFIED,
                               contextual_rating=None, review_required=review, status=st, status_reasons=tuple(reasons), usage=usage)
-        self._store(bundle, a, debate_id, status, role_notes, checked, calls, ph, applied, note)
+        self._store(bundle, a, debate_id, status, role_notes, checked, calls, ph, False, "pending commit", plan.base_version)
+        self._pending[a.assessment_id] = _PendingCommit(plan=plan, checked=checked, status=a.status)
         return a
 
-    def _store(self, bundle, a: ContextAssessment, debate_id, status, role_notes, checked, calls, ph, applied, note) -> None:
+    def commit(self, a: ContextAssessment, job: dict[str, Any] | None = None, owner: str | None = None,
+               queue=None) -> tuple[bool, ContextAssessment]:
+        """Phase 2. Returns (lease_held, final assessment).
+
+        With job + owner + queue (worker path) the planned rows are applied inside JobQueue.complete_with: the lease
+        is verified under the queue's write lock, the ledger is re-checked (job not applied before, not late, version
+        unchanged) and the job is marked DONE in the same transaction. A worker that lost its lease writes nothing
+        (its debate record keeps the audit trail). Without a job (direct use) only the ledger lock and checks apply."""
+        pend = self._pending.pop(a.assessment_id, None)
+        q = queue if queue is not None else self.queue
+        leased = job is not None and owner is not None and q is not None
+        if pend is None:  # no debate ran to the checks (missing data, unsupported, worker failure): nothing to apply
+            return (q.complete(job["job_id"], owner, a.assessment_id) if leased else True), a
+
+        def apply() -> tuple[bool, str]:
+            if a.status == ContextStatus.INVALID and pend.status != ContextStatus.INVALID:
+                return False, "common validation rejected the assessment; ledger unchanged"
+            return commit_ledger(self.cfg.paths.data_root, pend.plan)
+
+        if leased:
+            held, out = q.complete_with(job["job_id"], owner, a.assessment_id, apply)
+            if not held:
+                self._record_commit(a, False, "lease lost before commit: result discarded, ledger unchanged", {})
+                return False, a
+        else:
+            out = apply()
+        applied, note = out
+        self._record_commit(a, applied, note, pend.plan.id_map if applied else {})
+        upd: dict[str, Any] = {"status_reasons": (*a.status_reasons, f"hypothesis ledger: {note}")}
+        if not applied and pend.plan.id_map:  # canonical ids were never written: label claims with the debate's own ids
+            claims, counter, _ = project(pend.checked, {})
+            upd.update(claims=claims, counterclaims=counter)
+        return True, a.model_copy(update=upd)
+
+    def _record_commit(self, a: ContextAssessment, applied: bool, note: str, id_map: dict[str, str]) -> None:
+        rec = load_debate(self.cfg.paths.data_root, a.instrument, a.assessment_id)
+        if rec is None:
+            return
+        rec = rec.model_copy(update={"applied_to_ledger": applied, "ledger_note": note, "hypothesis_id_map": dict(id_map)})
+        atomic_write_json(debates_dir(self.cfg.paths.data_root, a.instrument) / f"{a.assessment_id}.debate.json", rec.model_dump(mode="json"))
+
+    def _store(self, bundle, a: ContextAssessment, debate_id, status, role_notes, checked, calls, ph, applied, note,
+               base_version: str | None = None) -> None:
         cfg = self.cfg
         rec = DebateRecord(
             debate_id=debate_id, assessment_id=a.assessment_id, instrument=bundle.instruments[0], as_of=bundle.as_of,
@@ -608,7 +782,7 @@ class DebateBackend:
             drafts=tuple(checked["drafts"]), critique=checked["critique"], revision=checked["revision"], synthesis=checked["synthesis"],
             check_failures=tuple(checked["failures"]), llm_calls=calls, max_llm_calls=cfg.context.debate.max_llm_calls,
             provider=cfg.context.llm.provider, model_id=cfg.context.llm.model_id, prompt_hash=ph, code_version=__version__,
-            status=checked["status"], applied_to_ledger=applied, ledger_note=note)
+            status=checked["status"], applied_to_ledger=applied, ledger_note=note, ledger_base_version=base_version)
         d = debates_dir(cfg.paths.data_root, bundle.instruments[0])
         d.mkdir(parents=True, exist_ok=True)
         atomic_write_json(d / f"{a.assessment_id}.debate.json", rec.model_dump(mode="json"))
@@ -619,19 +793,22 @@ def debate_summary(data_root: Path, inst: InstrumentKey, assessment_id: str, as_
     rec = load_debate(data_root, inst, assessment_id)
     if rec is None:
         return None
-    states = {k: v.state.value for k, v in states_at(load_ledger(data_root, inst), as_of).items()}
+    ledger = load_ledger(data_root, inst)
+    states = {k: v.state.value for k, v in states_at(ledger, as_of).items()}
     syn = rec.synthesis
-    canon = {}
-    for r in load_ledger(data_root, inst):
-        if r.debate_id == rec.debate_id and r.hypothesis is not None:
-            canon[(r.horizon_seconds, r.position, r.hypothesis.statement)] = r.hypothesis_id
+    id_map = rec.hypothesis_id_map  # same identity contract as the ledger and the projection
+    legacy = {}  # records written before hypothesis_id_map existed
+    if not id_map and rec.applied_to_ledger:
+        for r in ledger:
+            if r.debate_id == rec.debate_id and r.hypothesis is not None:
+                legacy[(r.horizon_seconds, r.position, r.hypothesis.statement)] = r.hypothesis_id
     horizons = []
     for hz in (syn.horizons if syn else ()):
         def view(h, pos):
             if h is None:
                 return None
             v = h.model_dump(mode="json")
-            v["canonical_id"] = canon.get((hz.horizon_seconds, pos, h.statement))
+            v["canonical_id"] = id_map.get(h.hypothesis_id) if id_map else legacy.get((hz.horizon_seconds, pos, h.statement))
             return v
         horizons.append({"horizon_seconds": hz.horizon_seconds, "primary": view(hz.primary, "primary"),
                          "opposing": [view(o, "opposing") for o in hz.opposing], "unresolved": list(hz.unresolved),

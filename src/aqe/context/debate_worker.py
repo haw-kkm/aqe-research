@@ -20,6 +20,7 @@ import operator
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -72,6 +73,8 @@ def scripted_model(options: dict):
 
     def respond(system: str, user: str) -> str:
         stage = re.search(r"STAGE:\s*(\w+)", system).group(1)
+        if stage in options.get("fail_stages", ()):  # simulated provider error (the attempt is still counted)
+            raise RuntimeError(f"scripted failure at {stage}")
         ids = ids_in(user) or ["missing-id"]
         horizons = [int(x) for x in re.findall(r"HORIZON_SECONDS:\s*(\d+)", system + "\n" + user)] or [3600]
         if stage.endswith("_DRAFT") or stage.endswith("_REVISION"):
@@ -136,9 +139,21 @@ def build_graph(job: dict, llm, log: list):
     max_calls = int(job.get("max_llm_calls", 8))
     roles = job["roles"]  # [{role, system, user}]
     active = [r["role"] for r in roles]
+    # Hard cap shared by ALL nodes. Parallel draft nodes see the same per-superstep state snapshot, so the state's
+    # `calls` cannot enforce the cap (review D05); each call takes a slot here atomically BEFORE invoking the model.
+    # Slots are never returned, even when the call fails (a failed call may still be billed).
+    slot_lock = threading.Lock()
+    slots = {"used": 0}
 
-    def call(stage: str, system: str, user: str, state_calls: int) -> tuple[str | None, dict]:
-        if state_calls >= max_calls:
+    def take_slot() -> bool:
+        with slot_lock:
+            if slots["used"] >= max_calls:
+                return False
+            slots["used"] += 1
+            return True
+
+    def call(stage: str, system: str, user: str) -> tuple[str | None, dict]:
+        if not take_slot():
             return None, {"stage": stage, "error": f"call budget {max_calls} exhausted", "attempted": False}
         t0 = time.time()
         try:
@@ -160,7 +175,7 @@ def build_graph(job: dict, llm, log: list):
     def draft_node(spec):
         def node(state: DebateState):
             # independent draft: sees only its own evidence slice, never other reports or prior synthesis
-            text, ev = call(f"{spec['role']}_DRAFT", spec["system"], spec["user"], state.get("calls", 0))
+            text, ev = call(f"{spec['role']}_DRAFT", spec["system"], spec["user"])
             obj, err = parsed(text)
             return {"drafts": {spec["role"]: {"raw": text, "parsed": obj, "error": err or ev.get("error")}},
                     "calls": 1 if ev["attempted"] else 0, "events": [ev]}
@@ -169,14 +184,14 @@ def build_graph(job: dict, llm, log: list):
     def critic(state: DebateState):
         drafts = {k: v["parsed"] for k, v in state["drafts"].items() if v.get("parsed") is not None}
         user = job["critic"]["user"].replace("{{DRAFTS_JSON}}", json.dumps(drafts, ensure_ascii=False))
-        text, ev = call("CRITIC", job["critic"]["system"], user, state.get("calls", 0))
+        text, ev = call("CRITIC", job["critic"]["system"], user)
         obj, err = parsed(text)
         return {"critique": {"raw": text, "parsed": obj, "error": err or ev.get("error")}, "calls": 1 if ev["attempted"] else 0, "events": [ev]}
 
     def needs_revision(state: DebateState) -> str:
         c = (state.get("critique") or {}).get("parsed") or {}
         role = c.get("revision_role")
-        budget_left = max_calls - state.get("calls", 0)
+        budget_left = max_calls - slots["used"]
         if role in active and budget_left >= 2:  # keep one call for the synthesis
             return "revise"
         return "synthesize"
@@ -188,7 +203,7 @@ def build_graph(job: dict, llm, log: list):
         issues = [i for i in c.get("issues", []) if i.get("target_role") == role]
         user = (spec["user"] + "\n\nCRITIQUE_OF_YOUR_DRAFT (address each issue; do not add new market data):\n"
                 + json.dumps(issues, ensure_ascii=False) + "\n\nYOUR_DRAFT:\n" + json.dumps(state["drafts"][role]["parsed"], ensure_ascii=False))
-        text, ev = call(f"{role}_REVISION", spec["system"].replace(f"STAGE: {role}_DRAFT", f"STAGE: {role}_REVISION"), user, state.get("calls", 0))
+        text, ev = call(f"{role}_REVISION", spec["system"].replace(f"STAGE: {role}_DRAFT", f"STAGE: {role}_REVISION"), user)
         obj, err = parsed(text)
         return {"revision": {"role": role, "raw": text, "parsed": obj, "error": err or ev.get("error")},
                 "calls": 1 if ev["attempted"] else 0, "events": [ev]}
@@ -200,15 +215,14 @@ def build_graph(job: dict, llm, log: list):
             drafts[state["revision"]["role"]] = rev
         user = (job["synthesis"]["user"].replace("{{REPORTS_JSON}}", json.dumps(drafts, ensure_ascii=False))
                 .replace("{{CRITIQUE_JSON}}", json.dumps((state.get("critique") or {}).get("parsed"), ensure_ascii=False)))
-        text, ev = call("SYNTHESIS", job["synthesis"]["system"], user, state.get("calls", 0))
+        text, ev = call("SYNTHESIS", job["synthesis"]["system"], user)
         obj, err = parsed(text)
-        used = state.get("calls", 0) + (1 if ev["attempted"] else 0)
         out = {"synthesis": {"raw": text, "parsed": obj, "error": err or ev.get("error"), "format_fixed": False},
                "calls": 1 if ev["attempted"] else 0, "events": [ev]}
-        if obj is None and text is not None and used < max_calls:
+        if obj is None and text is not None and slots["used"] < max_calls:
             # one format-only repair: same content, no new data, no new debate
             fix_user = job["format_fix"]["user"].replace("{{BAD_OUTPUT}}", text[:6000])
-            text2, ev2 = call("FORMAT_FIX", job["format_fix"]["system"], fix_user, used)
+            text2, ev2 = call("FORMAT_FIX", job["format_fix"]["system"], fix_user)
             obj2, err2 = parsed(text2)
             out = {"synthesis": {"raw": text2, "parsed": obj2, "error": err2 or ev2.get("error"), "format_fixed": obj2 is not None},
                    "calls": (1 if ev["attempted"] else 0) + (1 if ev2["attempted"] else 0), "events": [ev, ev2]}
