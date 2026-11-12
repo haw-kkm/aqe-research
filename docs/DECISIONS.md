@@ -155,3 +155,38 @@
   Defaults are explicit development values, not tuned on the locked segment. offline_scripted selections stay
   excluded from analysis and are labelled SCRIPTED_TEST. Not done: G01 live-bar merge, tick import source, real LLM,
   scoring of plan outcomes, simulation.
+
+## ADR-0015 — One codebase, one verified commit, role-separated cloud hosts (2026-11-12, branch dev/cloud-deploy)
+- Context: the Windows PC runs the collector from `main`; development continues in `aqe-dev`. Target: Oracle ARM64
+  (24/7 collection + light inference) and Google x86-64 (on-demand training), without separate projects, without
+  touching the running collector or its data, and without letting unverified dev work reach a server.
+- Decision: (1) servers install exactly one 40-hex commit (`deploy/linux/install_release.sh`; branch names refused) after
+  `python -m aqe.ops code-release-check` (clean tree, tests) and run tests + role preflight on the target before switching
+  `/opt/aqe/current`; services are never restarted automatically. (2) Roles differ only by config/units:
+  `configs/cloud/{oracle_collector,oracle_shadow,google_cpu_train,google_gpu_train}.yaml` with `${VAR:-default}` paths;
+  cloud experiment configs equal `experiment.yaml` except `base_config` (test-enforced); per-platform requirement files
+  (`requirements/`), the Windows CUDA lock is not used on servers; wheel availability checked from index metadata.
+  (3) Data moves only through `aqe.ops.transfer`: dry-run default, SHA-256 per file, resumable, never overwrites
+  (different content -> quarantined conflict), live/host-local files excluded, journal + receipt + volume log, rollback
+  moves (never deletes). SQLite sources are never opened by SQLite (a read-only WAL open creates sidecars): copy, then
+  backup API + integrity_check on the copy. Manifests are copied verbatim and verified by path rebasing (their hash is
+  lineage). (4) Models move as releases: build (Google) -> stage (Oracle) -> verify (integrity, OOS fold leakage,
+  inference smoke through `predict_horizon` + risk engine on that host) -> activate only with `--approve <id>` ->
+  registry rollback; artifacts are never overwritten or deleted. (5) Linux collector: systemd unit with KillMode=mixed +
+  KillSignal=SIGINT and SIGTERM mapped to KeyboardInterrupt (flush + checkpoint), preflight (time sync, Binance clock,
+  single collector) as ExecStartPre, 5-minute healthcheck; quality events (book desync/resync, disconnects, restarts)
+  are now journaled append-only under `{data_root}/quality/`. (6) PC -> Oracle cutover only after a GO comparison
+  (coverage/book/trades/health over >= 24 h), a complete migration receipt and an explicit recorded approval; the
+  operator stops the PC collector manually.
+- Not done / limits: nothing ran on ARM64, Linux, a GPU or a real SSH link; Google training has stage-level resume
+  only (no epoch checkpoints) -> Spot VMs not recommended yet; G01 (live-bar merge) still open; no trading path exists.
+- Addendum (collector migration, 2026-11-12): `transfer --mode mirror` for downstream replicas (Oracle -> Google)
+  replaces a file only when the destination still holds the exact version it last received from the same source
+  (`_transfer/received_index.json`), keeping the old version; `safe` stays the default (Windows -> Oracle).
+  Overlapping collector partitions (PC and Oracle both collected the same hour) are unioned explicitly with
+  `transfer-merge`: collector keys, destination rows win, backup + verification, live files deferred. One data store
+  has one collecting host: `status/collector_owner_<symbol>.json` (host-local) makes the supervisor refuse a second
+  host. Parquet transfers are checked for readability, schema and partition period; files being written (`*.open`,
+  recent partitions) wait for the next incremental pass instead of being copied mid-write. A collector-only
+  requirements file (`requirements/linux-arm64-collector.txt`, no ML libraries) is supported because the collect path
+  imports none (test). Oracle may run a daily REST backfill timer so Google syncs one data source.

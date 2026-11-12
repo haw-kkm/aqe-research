@@ -1,83 +1,95 @@
-# RESUME_DEV — 개발 worktree 인수인계 (분석·토론 계층 + 진입·손절·익절 후보)
+# RESUME_DEV — 개발 worktree 인수인계 (토론 계층 · trade plan · 클라우드 배포)
 
-갱신: 2026-11-12 05:00 KST (2026-11-11 20:00 UTC) · 개발 폴더 전용 문서. 원본 `C:\vscode\aqe`의 BUILD_STATUS/NEXT_SESSION은 수정하지 않았다.
+갱신: 2026-11-12 23:45 KST(릴리스 정리) · 개발 폴더 전용 문서. 원본 `C:\vscode\aqe`의 BUILD_STATUS/NEXT_SESSION은 수정하지 않았다.
 
 ## 1. 위치·브랜치·격리 (현재 상태)
 | 항목 | 값 |
 |---|---|
-| 원본(수집기 사용 중) | `C:\vscode\aqe` · `main` @ `1785160`(토론 계층 **초기 초안** 포함). 이번 세션 쓰기 0건, git status 깨끗함 |
-| 실행 중 수집기 | `local-collector/collect_local.py --project-root C:\vscode\aqe` → `aqe collect` (PID 6220/32640/35508/35964, 2026-11-11 13:40 KST 시작, run `run-20261111T044005Z-29fc10ca`), data_root `E:\aqe-v2\data`. 종료 시 원본 `src`를 다시 import해 자동 재시작 |
-| 개발 폴더 | `C:\vscode\aqe-dev` = git worktree, 브랜치 `dev/debate-layer-update` @ **`aadae59`**(사용자 커밋·push = 재검토 R01/R02 수정). 그 위에 **이번 세션 진입·손절·익절 후보 작업 미커밋**(§2) |
-| 브랜치 이력 | 0f5d4f0(토론 계층 v0.1) → 4304c5f(검토 D01–D05) → aadae59(재검토 R01/R02) → 미커밋(trade plan). 로컬 `dev/debate-layer`는 0f5d4f0에 멈춘 옛 이름 |
-| 개발 venv | `aqe-dev\.venv` (Python 3.12.10, torch 2.15.0+cpu), `aqe-dev\.venv-ta` (TradingAgents 0.7.1 @ 9fa1196, LangGraph 1.2.20) |
-| 개발 데이터 | `E:\aqe-v2-dev\data`, `E:\aqe-v2-dev\artifacts` — 쓰기가 끝난 파일 복사본 + 개발 루트 REST 보충(5m 봉은 2026-11-11 15:15Z까지, flow 요약은 14:00Z까지). **`make_dev_snapshot.py`를 다시 돌리면 보충된 5m 봉 파티션을 원본 사본으로 덮어쓴다**(이번에는 실행하지 않음) |
+| 원본(수집기 사용 중) | `C:\vscode\aqe` · `main` @ `1785160`. 이번 세션 원본 코드·설정·venv 쓰기 0건, git status 깨끗함 |
+| 실행 중 수집기 | `local-collector/collect_local.py --project-root C:\vscode\aqe` (PID 6220/32640/35508/35964, 2026-11-11 13:40 KST 시작, run `run-20261111T044005Z-29fc10ca`), data_root `E:\aqe-v2\data`. 중지·재시작 없음 |
+| 개발 폴더 | `C:\vscode\aqe-dev` = git worktree, **브랜치 `dev/cloud-deploy`**(2026-11-12 `dev/debate-layer-update` @ `aadae59`에서 생성), push 안 함 |
+| 커밋 | `aadae59` → **`5caee5f`** AI 토론 계층 trade plan(ADR-0014) → **클라우드 배포 대응 커밋**(ADR-0015, 이 문서를 포함한 커밋 = 브랜치 HEAD = Oracle 배포 대상). 미커밋 0 |
+| 분리 방법 | 작업 트리를 건드리지 않고 인덱스로만 분리: 보존 패치(`git apply --cached`) + trade plan 신규 파일 8개 → 커밋 1, 나머지 전부 → 커밋 2. 공통 파일 5개(config, debate.py, DECISIONS, OPERATIONS, RESUME_DEV)는 덩어리 단위로 확인 |
+| 보존 사본 | `E:\aqe-v2-dev\preserve\aqe-dev-uncommitted-20261112T130656Z\`(커밋 1 원본: `tracked.patch`, 신규 파일 8개, `SHA256SUMS`) — 커밋 후에도 유지 |
+| 개발 venv | `aqe-dev\.venv` (Python 3.12.10, torch 2.15.0+cpu), `aqe-dev\.venv-ta` |
+| 개발 데이터 | `E:\aqe-v2-dev\data`/`artifacts`(스냅샷), `E:\aqe-v2-dev\cloud-sim\`(이전·릴리스 리허설 대상), `E:\aqe-v2-dev\inventory\`(인벤토리·wheel 확인 결과) |
 
-**main 병합 주의**: main(1785160)의 토론 계층 초기 초안 때문에 `src/aqe/context/debate.py`, `debate_worker.py`, `src/aqe/contracts/debate.py`가
-add/add 충돌한다 → **개발 브랜치 쪽 채택**. 수집기는 재시작 시 원본 `src`를 import하므로 원본 반영 시점은 사용자가 정한다(§5).
+**커밋 의존 관계**: 커밋 1은 단독으로 동작한다(아래 §3, `git archive`로 따로 풀어 전체 시험). 커밋 2는 커밋 1 위에서만 의미가 있다
+(공통 파일 `config/__init__.py`·`debate.py`의 덩어리가 커밋 1 내용 위에 얹힘; 클라우드 설정은 `planning.enabled: false`로 trade plan을 끈 채 사용).
+main 병합 시 debate 파일 3개 add/add 충돌 → 개발 쪽 채택.
 
-## 2. 이번 세션: 진입·손절·익절 후보와 검토안 (`AQE_Claude_Trade_Plan_Prompt_KO_2026-11-12.md`) — 미커밋
-상세 `docs/TRADE_PLAN.md`, 결정 ADR-0014. 기본 **비활성**(`planning.enabled: false`), 개발 설정 `configs/dev_trade_plan_offline.yaml`에서만 켬.
+**주의(이번 세션 사고)**: 첫 인벤토리 실행(22:28:59)이 원본 `E:\aqe-v2\data\meta\`에 `aqe_meta.sqlite-shm`(32 KB)·`aqe_meta.sqlite-wal`(0 B)를
+**새로 만들었다**(읽기 전용 `mode=ro`라도 WAL DB를 열면 생긴다). DB 본체(`aqe_meta.sqlite`, 최종 수정 2026-11-11 13:03)는 그대로이며 두 파일은 데이터가 없는 보조 파일이다.
+원본 폴더에서 삭제하지 않았다 — 지울지는 사용자 결정(AQE 프로세스가 그 DB를 열고 있지 않을 때). 코드는 이후 원본을 SQLite로 열지 않도록(복사 후 백업) 고쳤고 재발하지 않음을 확인했다.
 
-| 단계 | 구현 |
+## 2. 이번 세션: 클라우드 대응 (`AQE 프로젝트 — Oracle + Google Cloud 배포 대응` 프롬프트)
+상세 `docs/CLOUD_DEPLOYMENT.md`, 결정 ADR-0015.
+| 영역 | 구현 |
 |---|---|
-| 계약 | `contracts/plan.py`: PlanCandidate·PlanCandidateSet(내용 해시 ID), PlanSelection(가격 필드 없음), PlanSelectionRecord, TradePlan(LONG/SHORT은 REVIEW_CANDIDATE + 실제 LLM 선택 ACCEPTED + 검사 전부 PASS + 진입 조건 전부 MET일 때만, `approval_required=True`·`execution_enabled=False` 고정) |
-| 후보 계산 | `planning/candidates.py` `swing_atr_v0`(순수): 확정 봉만, 완전한 상위 시간봉만, pivot은 확인 봉 가용 뒤(`confirmed_at`), 유지된 지지/저항, ATR 완충, 유지된 반대편 swing을 익절로, tick import 있으면 불리한 쪽 반올림 후 재검사, 기존 `trade_return`으로 보수적 진입가 기준 비용 후 보상·손실·RR(funding 미포함), 자료 없음·STALE·가격대 없음 → 후보 없음 + 사유 |
-| 토론 연결 | `EvidenceBundle.plan_candidates`(있을 때만 해시) → CHART·FLOW·CRITIC 공유 문맥, SYNTHESIS `plan_selection`(추가 호출 없음). `planning/selection.py` 코드 검사, `DebateRecord.plan_snapshot_id/plan_selections`, 커밋 트랜잭션 안에서 최종화(원장 미반영 → NOT_COMMITTED). worker는 형식 보완 전 원문(`raw_before_fix`)을 남기고, scripted 모델에 선택 모드 추가 |
-| 최종 계획·보고서 | `planning/plan.py`: 커밋된 선택 + 같은 스냅샷(ID 대조) + 기존 위험 판정 → 기간별 TradePlan. `aqe analyze` JSON `trade_plans`/`planning`, Markdown `4b` 절, `aqe report` 재렌더 |
-| 근거 정정 | `context/evidence.flow_summary_item`: 수집기 열 이름(`depth_bid_10bps_quote` 등)으로 수정(이전에는 `bid_depth_10bps_quote`를 찾아 깊이가 빠짐), 호가는 `book_valid` 행만, 체결은 aggTrade 누락 없는 구간만, as_of 기준 시간 파티션, 10분 넘으면 STALE |
+| 배포 버전 | `python -m aqe.ops code-release-check`(깨끗한 단일 커밋 + 시험), `deploy/linux/install_release.sh <40자리 SHA> <role>`(브랜치 거부, 대상 서버 시험·사전 점검 후 current 전환, 재시작 안 함), `rollback_release.sh` |
+| 설정 | `configs/cloud/` 역할 4개 + 실험 3개(`base_config`만 다름, 시험 강제). 경로 `${AQE_DATA_ROOT:-/srv/aqe/data}` 지원(설정 로더), `configs/<그룹>/` 하위 설정의 프로젝트 루트 계산 수정 |
+| Linux 호환 | `.venv-ta` Scripts↔bin 자동 대응(`aqe.ops.platform`), `scripts/run_pipeline.sh` OS 중립, `.gitattributes`(sh·unit LF), 수집기 SIGTERM→정상 종료 경로, Linux 시계 안내 |
+| 의존성 | `requirements/common.txt` + `linux-arm64-cpu` / `linux-x86_64-cpu` / `linux-x86_64-cuda`, `scripts/check_wheels.py`(색인 메타데이터 확인) |
+| 수집기 | 품질 이벤트(호가 desync·재동기화·끊김·재시작) 추가 전용 일지 `{data_root}/quality/…/<UTC일>.jsonl` (`ingestion/collector.py`) |
+| Oracle 운영 | systemd: `aqe-collector@`(KillMode=mixed, SIGINT, Restart=always, ExecStartPre 사전 점검), `aqe-health@` 5분 timer, `aqe-alert@`, `aqe-shadow`(기본 비활성), logrotate, journald 상한, `bootstrap_host.sh` |
+| 데이터 | `aqe.ops.inventory`(분류·용량·기간·manifest SHA·SQLite 사본 무결성·모델 상태), `aqe.ops.transfer`(DRY-RUN 기본, SHA-256, 재개, 덮어쓰기 없음·충돌 보관, 원격 ssh/scp, 롤백=이동), `sqlite-backup/restore` |
+| 모델 | `aqe.ops.release`: build → stage → verify(무결성·누수·현 서버 추론·위험 엔진·활성 모델 비교) → `--approve` 활성화 → 레지스트리 롤백 |
+| Google | `deploy/google/train_pipeline.sh`(단계 재개, 잠금 평가는 `--allow-locked-evaluate`일 때만, `--shutdown-after`), `sync_from_oracle.sh`(증분 pull) |
+| 전환 | `aqe.ops.cutover`: 병행 수집 비교(커버리지·호가·체결·헬스) → GO/NO-GO → 승인 기록만(수집기를 멈추지 않음) |
+| 보안 | `.gitignore`에 키·`.env.*`·자격 증명 패턴, `deploy/linux/aqe.env.example`(비밀 없음) |
+| 수집기 이전 추가(같은 날 후속 요구) | 전송 `--mode mirror`(Google 복제: 받은 그대로일 때만 갱신, 이전 버전 보관) · `transfer-merge`(겹친 PC/Oracle 파티션을 수집기 키로 합침, 대상 행 우선, 백업) · 저장소 소유 표시 `status/collector_owner_<sym>.json`(다른 호스트 시작 거부) · Parquet 스키마·파티션 기간 검사, 읽을 수 없는 Parquet 제외 · 수집기 전용 의존성 `requirements/linux-arm64-collector.txt` + `install_release.sh`의 `AQE_REQUIREMENTS` · Oracle `aqe-backfill.service/.timer`(선택) · 문서 §13 |
 
-변경 파일: 신규 `src/aqe/contracts/plan.py`, `src/aqe/planning/{__init__,candidates,selection,plan}.py`, `tests/test_trade_plan.py`(45개),
-`configs/dev_trade_plan_offline.yaml`, `docs/TRADE_PLAN.md` / 수정 `src/aqe/config/__init__.py`(PlanningConfig), `src/aqe/contracts/context.py`
-(optional `plan_candidates` + 해시), `src/aqe/contracts/debate.py`(`plan_selection`, `plan_snapshot_id`, `plan_selections`), `src/aqe/context/evidence.py`,
-`src/aqe/context/debate.py`, `src/aqe/context/debate_worker.py`, `src/aqe/cli/analyze.py`, `src/aqe/reporting/report.py`, `docs/DECISIONS.md`(ADR-0014),
-`docs/DEBATE_LAYER.md`(§6), `docs/IMPORT_FORMATS.md`(instrument spec), `docs/OPERATIONS.md`, `docs/schemas/EvidenceBundle·EvidenceItem.schema.json`
-(재생성 — EvidenceItem의 `AQE_NUMERIC` 누락은 토론 계층 때부터의 이전 불일치), 이 파일.
-API: `compute_bundle_hash(..., plan_candidates=None)`(기존 호출 그대로 동작), `check_debate` 결과에 `plan_selections`, `debate_summary`에 `plan_snapshot_id`·`plan_selections`.
-
-## 3. 검증 결과 (모두 개발 venv, Windows 11 Pro 10.0.26200, Python 3.12.10)
+## 3. 검증 결과 (Windows 11 Pro 10.0.26200, 개발 `.venv` Python 3.12.10)
 | 명령 (cwd `C:\vscode\aqe-dev`) | 결과 |
 |---|---|
-| `.venv\Scripts\python -m pytest -q -p no:cacheprovider tests/test_debate_layer.py` (핵심 코드 변경 후) | **41 passed**, exit 0, 44.6초 — D01–D05·R01/R02 회귀 유지 |
-| `... pytest tests/test_trade_plan.py -m "not slow"` / `-m slow` | **38 passed** / **7 passed**(`.venv-ta` 실제 LangGraph worker, scripted LLM), skip 0 |
-| `... pytest -q -p no:cacheprovider` (전체) | **195 passed**, exit 0, 98.1초 (이전 150 + 신규 45). 마지막 코드 수정 뒤 재실행: **195 passed**, exit 0, 75.2초 |
-| 비활성 시 프롬프트 비교: scratchpad `cmp_prompts.py`(HEAD의 debate.py와 대조) | 프롬프트 동일 True, prompt hash 동일 True |
-| 변이 확인: 가격 텍스트 검사·원장 미반영 시 NOT_COMMITTED를 임시로 끄고 실행 | 해당 시험 2개 실패(검출됨) → 원복 후 38 passed |
-| 실제 자료 스냅샷 A: `aqe context-enqueue/context-worker --once/analyze --config configs\dev_trade_plan_offline.yaml --as-of 2026-11-11T14:05:10Z` | 모두 exit 0. flow 근거 55행(14:00Z까지, depth·imbalance 표시). 1h·24h 각각 기술적 LONG·SHORT 후보(진입 조건 `close_in_zone` 미충족, tick UNKNOWN), 위험 RESEARCH_ONLY, 선택 출처 UNAVAILABLE → **WAIT** |
-| 스냅샷 A 재실행(최종 코드, 입력 표기 변경으로 새 묶음) | enqueue 0 / worker: 출력 첫 줄만 보려던 `Select-Object -First 1`이 프로세스를 끊어 **exit -1·run 기록 RUNNING**(작업 자체는 DONE·outbox 0 확인, 이어서 `--once` exit 0) / analyze 0 |
-| 실제 자료 스냅샷 B: 같은 명령 `--as-of 2026-11-11T14:10:10Z` (최종 코드) | 모두 exit 0. flow 마지막 가용 14:00:00.029Z → **STALE, 항목 없음**. 1h 후보는 TP1 순RR < 1.0으로 선택 불가 → scripted 선택 null, 24h는 LONG 선택(ACCEPTED, scripted). 분석은 scripted 제외 → **1h·24h WAIT** |
-| 원장: `load_ledger/verify_ledger(E:\aqe-v2-dev\data\meta\aqe_meta_trade_plan.sqlite)` | 14행, 문제 0 |
+| `.venv\Scripts\python -m pytest -q -p no:cacheprovider` (testpaths에 `local-collector/tests` 추가) | **243 passed**, exit 0, 137.5초 (기존 195 + cloud 33 + local-collector 15), skip 0 |
+| local-collector 시험 원래 상태 확인 | HEAD 버전도 개발 venv에서 2개 실패/정지(설치된 `aqe`가 시험용 가짜 패키지를 가림) → 시험 픽스처를 일반 패키지로 고쳐 15 passed |
+| 변이 확인(덮어쓰기 금지·활성화 승인 제거) | 해당 시험 실패로 검출, 원복 후 통과 |
+| `python -m aqe.ops inventory --data-root E:\aqe-v2\data --artifact-root E:\aqe-v2\artifacts …` | exit 0, 17초. data 373개 0.808 GiB, artifacts 110개 0.255 GiB, manifest 87/87 SHA 일치, SQLite 사본 ok, 모델 12슬롯 OK |
+| `scripts/check_wheels.py` × 3 플랫폼 + TA(arm64) | 모두 exit 0: 42/42, 42/42, 42/42, 85/85 WHEEL (설치 아님) |
+| 실데이터 이전 리허설: `transfer --source E:\aqe-v2\data --dest E:\aqe-v2-dev\cloud-sim\oracle\data` | DRY-RUN(대상 0건) → `--execute` 361개 852 MB 53초 complete → 재실행 361 SKIP + 1 신규. artifacts 106개 247 MB complete |
+| 릴리스 리허설(운영 artifact 읽기 → cloud-sim) | build 12 artifact/37 파일 → stage → verify passed(1h·24h LGBM·TCN OK, 위험 ABSTAIN, 실행 false) → 승인 없는 활성화 exit 1 → 승인 활성화 → 롤백 exit 0 |
+| `python -m aqe.ops health --config configs\local.yaml`(운영 수집기, 기록 안 함) | exit 0, OK: 상태 8.5초 전, SYNCED, 피드 지연 ~8.5초, 시계 73.6 ms |
+| `preflight --role oracle-collector`(이 PC, sim 경로) | exit 0, WARN(OS/arch 다름·Windows 시계 수동), Binance REST 도달·시계 -73.7 ms PASS |
+| `bash -n` 배포 스크립트 6개 | 문법 OK (실행은 Linux에서만) |
+| (후속) 전체 `pytest -q -p no:cacheprovider` | **249 passed**, exit 0, 121.2초, skip 0 |
+| (후속) `pytest tests/test_cloud_ops.py` | **39 passed**(미러 갱신·충돌, 합치기·보류·멱등, 소유 표시, 파티션·손상 Parquet, ML 미사용 수집 경로, Windows→Oracle 전환 순서) |
+| (후속) `check_wheels.py requirements/linux-arm64-collector.txt --platform linux_aarch64` | 23/23 WHEEL, exit 0 |
+| (후속) 실제 수집 75초: `collect_local.py --project-root C:\vscode\aqe-dev --config configs\cloud\oracle_collector.yaml --duration-seconds 75` (AQE_DATA_ROOT=`E:\aqe-v2-dev\collector-smoke\data`) | 감독자 exit 0, Binance 시계 -78.8 ms, 호가 SYNCED, 메시지 ~2,500, raw 3개 닫힘·`.open` 0, 품질 일지 9건, checkpoint·소유 표시·final 상태, Parquet 파티션 검사 통과 |
+| (릴리스 정리) 커밋 1 단독: `git archive 5caee5f`를 `E:\aqe-v2-dev\verify\c1`에 풀고 `PYTHONPATH=…\c1\src`로 전체 `pytest` | **195 passed**, exit 0, 132.2초, skip 0 (커밋 1은 testpaths = tests) |
+| (릴리스 전 검증) `pip install --dry-run --only-binary=:all: --platform manylinux_2_28_aarch64 … --python-version 3.12 --abi cp312 -r requirements/linux-arm64-{collector,cpu}.txt` | 둘 다 exit 0: 수집기 전용 24개·전체 42개를 aarch64 cp312 **wheel만으로 해결**, 버전 불일치 0(마커는 이 Windows 호스트 기준으로 평가됨 → `colorama` 고정 추가) |
+| (릴리스 전 검증) ML 차단 시뮬레이션(`sitecustomize`로 torch·LightGBM·sklearn·SciPy import 차단) + 수집기 시험 묶음 | 39 passed, 차단된 import 시도 0 |
+| (릴리스 전 검증) ML 차단 상태 실제 수집 60초(Oracle 설정, `E:\aqe-v2-dev\collector-smoke-noml`) | 감독자 exit 0, 차단 시도 0, final, `.open` 0, raw 3개 닫힘, 메시지 ~5,100 |
+| (릴리스 전 검증) 원본 무변경 | 모델·학습·평가·위험 코드와 실험·위험 설정: aadae59 대비 diff 0. `E:\aqe-v2\artifacts` 106개, `E:\aqe-v2\data`의 manifest·보고서·context·REST 봉 105개: 오늘 인벤토리 SHA-256과 전부 동일. SQLite 보조 파일 2개 그대로 |
+| (릴리스 전 검증) 병합 정확도 시험 | 키가 같은 행 = 중복(동일 5·상이 5 → Oracle 행 유지), 키가 다른 겹친 구간 행 10개만 추가, 들어온 파일 내부 중복 제거, ns/us 단위 차이 정규화, 시간대 없는 키는 자동 병합 거부, PC 원본·충돌 사본 해시 불변 |
+미실행: ARM64/Linux 설치·시험·추론, Google CPU·GPU, 실제 SSH 전송, systemd 동작, Linux SIGTERM 실제 프로세스 경로, 클라우드에서 Binance, Spot 중단, 실제 전환.
+실제 LLM 호출 0, 모델 학습 0, 시뮬레이션 0, 주문 0, 클라우드 자원 생성 0, push 0.
 
-보고서: `E:\aqe-v2-dev\data\reports\analysis-20261111T195547Z-651b38c7.{json,md}`(B), `...195454Z-928ece73`(A 재실행), `...195228Z-f3fafa62`(A).
-증거 구분: **가격 후보 계산·표시(실제 자료 스냅샷)** + **대체 LLM 배선·계약·장애 시험**. 실제 LLM 호출 0, 모델 학습 0, 시뮬레이션 0, 주문 0.
-실제 AI 선택 품질·후보의 수익성은 검증하지 않았다. RESEARCH_ONLY 그대로.
-
-## 4. 남은 작업 (우선순위, 서로 별개)
-1. 사용자 결정: 이번 미커밋 변경 커밋/push, 이후 main 병합 시점(add/add 충돌 → 개발 쪽 채택).
-2. G01: `5m_live`/REST 봉 공통 조회 — 후보·토론·분석 모두 REST `5m`만 읽음(라이브에서 오래되면 STALE/WAIT).
-3. tick import(거래소 exchangeInfo 등, `docs/IMPORT_FORMATS.md` 형식) — 지금은 없어서 `tick_size=UNKNOWN` → 항상 WAIT.
-4. 실제 LLM 선정·연결(제공자·키·가격표·예산 결정 후) — 실제 선택 품질 미검증, 예산 0이라 거부됨.
-5. 가설·계획 결과 채점(구조안 §9): 후보 도달·RR 실현 여부 측정.
-6. 향후 시뮬레이션(리플레이·체결 모델) — 이번 범위 밖.
-7. NEWS·CROSS_MARKET 활성화, 토론 job 생성 규칙, 원장 부분 조회·outbox 오류 알림(이전 목록 유지).
+## 4. 남은 작업 (우선순위)
+1. 사용자 결정: `dev/cloud-deploy` push(두 커밋 완료, push 안 함), 원본 `E:\aqe-v2\data\meta`의 보조 파일 2개 처리(삭제하지 않았음).
+2. Oracle 서버 생성(사용자) → `bootstrap_host.sh` → `install_release.sh <SHA> oracle-collector` → 서버에서 시험·사전 점검(ARM64 실측) → 병행 수집 ≥ 24h.
+3. Windows→Oracle 실제 SSH 전송(§5 명령), Oracle에서 `release-verify`로 ARM64 추론 확인.
+4. TCN epoch 체크포인트·재개(구현 전 Spot VM 비권장), G01(`5m_live`/REST 공통 조회 — shadow 분석 전제).
+5. 전환 판정(`cutover-compare`) → 사용자 승인 → 사용자가 Windows 수집기 정지 → 최종 증분 이전 → `transfer-merge`(겹친 구간) — `docs/CLOUD_DEPLOYMENT.md` §13.5.
+6. 이전 목록: 가설·계획 채점, 실제 LLM 선정, tick import, NEWS/CROSS_MARKET.
 
 ## 5. 수집기에 아직 적용하지 않은 변경
-없음(수집기 코드·설정·venv·데이터 변경 0건). 개발 브랜치 변경 중 수집기가 import할 수 있는 모듈: `config/__init__.py`(`LocalConfig.planning`
-기본값 추가 — 기존 YAML 그대로 로드, 수집 경로 불변), `contracts/context.py`(optional 필드), `storage/metadb.py`(aadae59의 표 3개·트리거).
-원본 반영 후 재시작 시 `aqe_meta.sqlite`에 빈 표가 생길 수 있다(하위 호환). trade plan 기능은 설정에서 켜지 않으면 동작하지 않는다.
+없음(원본 코드·설정·venv 변경 0, 수집기 중지 0). 원본에 반영되면 영향이 있는 것: `local-collector/collect_local.py`(Windows 동작 동일, POSIX SIGTERM 처리 추가,
+시작 시 `status/collector_owner_BTCUSDT.json` 생성 — 이후 다른 호스트 이름으로는 같은 저장소 수집 거부),
+`ingestion/collector.py`(품질 일지 파일 추가 기록 — data_root에 `quality/` 생성), `config/__init__.py`(`${VAR:-기본값}`·하위 설정 루트), `storage/metadb.py`(aadae59 표 3개).
+반영 시점은 사용자가 정한다(수집기는 재시작 때 원본 `src`를 다시 import).
 
 ## 6. 다음 명령
 ```powershell
 cd C:\vscode\aqe-dev
-git status; git log --oneline -1                       # dev/debate-layer-update @ aadae59 + 미커밋(§2)
-.venv\Scripts\python -m pytest -q -p no:cacheprovider tests\test_trade_plan.py tests\test_debate_layer.py
-# 실제 자료 스냅샷 한 시점(개발 전용 DB meta/aqe_meta_trade_plan.sqlite; 같은 as_of 재실행은 같은 job으로 합쳐짐)
-.venv\Scripts\aqe context-enqueue --config configs\dev_trade_plan_offline.yaml --as-of 2026-11-11T14:10:10Z
-.venv\Scripts\aqe context-worker  --config configs\dev_trade_plan_offline.yaml --once
-.venv\Scripts\aqe analyze         --config configs\dev_trade_plan_offline.yaml --as-of 2026-11-11T14:10:10Z   # 보고서 4b 절
+git status; git log --oneline -3                       # dev/cloud-deploy: 클라우드 커밋 <- 5caee5f <- aadae59, 미커밋 0
+.venv\Scripts\python -m pytest -q -p no:cacheprovider tests\test_cloud_ops.py local-collector\tests
+.venv\Scripts\python -m aqe.ops inventory --data-root E:\aqe-v2\data --artifact-root E:\aqe-v2\artifacts --out-md E:\aqe-v2-dev\inventory\inventory_latest.md
+.venv\Scripts\python -m aqe.ops transfer --source E:\aqe-v2\data --dest E:\aqe-v2-dev\cloud-sim\oracle\data --kind data   # DRY-RUN
 ```
 
 ## 7. 다음 세션 재개 지시문
-"C:\vscode\aqe-dev(브랜치 dev/debate-layer-update @ aadae59, 진입·손절·익절 후보 작업 미커밋)에서 docs/RESUME_DEV.md, docs/TRADE_PLAN.md,
-docs/DECISIONS.md ADR-0014를 읽고 '남은 작업' 1번(사용자 결정) 이후 항목부터 이어가라. 원본 C:\vscode\aqe와 E:\aqe-v2\data는 실행 중인 수집기가
-사용하므로 쓰지 말고, 개발 venv(aqe-dev\.venv, .venv-ta)와 E:\aqe-v2-dev 스냅샷으로만 시험하라. make_dev_snapshot.py는 보충된 5m 봉을 덮어쓰므로
-그대로 다시 돌리지 마라. 실제 LLM 호출·모델 재학습·시뮬레이션·모의 주문·RESEARCH_ONLY 해제는 하지 마라."
+"C:\vscode\aqe-dev(브랜치 dev/cloud-deploy, 커밋 5caee5f(trade plan) 위의 클라우드 배포 커밋 = Oracle 배포 대상)에서 docs/RESUME_DEV.md, docs/CLOUD_DEPLOYMENT.md,
+docs/DECISIONS.md ADR-0014·0015를 읽고 '남은 작업' 1번(사용자 결정) 이후를 이어가라. 원본 C:\vscode\aqe, E:\aqe-v2\data, E:\aqe-v2\artifacts는
+실행 중인 수집기가 사용하므로 쓰지 말고(조사는 읽기 전용, SQLite는 복사본으로만), 개발 venv와 E:\aqe-v2-dev로만 시험하라. 클라우드 자원 생성, push,
+실제 LLM 호출, 모델 재학습, 실거래 활성화는 하지 마라."

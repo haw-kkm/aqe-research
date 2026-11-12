@@ -1,0 +1,11 @@
+# sudo systemctl enable --now aqe-backfill.timer
+[Unit]
+Description=AQE REST backfill daily (00:20 UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

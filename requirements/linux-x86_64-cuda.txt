@@ -1,0 +1,6 @@
+# Google Cloud GPU VM (Ubuntu x86-64 + NVIDIA, Python 3.12): TCN training on CUDA.
+# Same CUDA line as the Windows dev lock (torch 2.15.0+cu132). Needs an NVIDIA driver that supports CUDA 13.2;
+# verify `nvidia-smi` on the VM first. Status: availability checked from index metadata only — NOT installed/tested.
+--extra-index-url https://download.pytorch.org/whl/cu132
+-r common.txt
+torch==2.15.0+cu132

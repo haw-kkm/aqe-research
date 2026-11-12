@@ -60,6 +60,31 @@ class DestinationLock:
             self.handle = None
 
 
+def claim_data_root(root: Path, symbol: str, host: str | None = None) -> dict:
+    """One collecting HOST per data store. The OS lock only guards processes on one machine; this marker
+    (`status/collector_owner_<symbol>.json`, host-local: never transferred) refuses a second host that would write
+    the same store (e.g. a shared/mounted disk or a copied root that kept its status dir). Remove the marker only
+    after deciding which host owns the store."""
+    import socket
+
+    host = host or socket.gethostname()
+    path = root / "status" / f"collector_owner_{symbol}.json"
+    now = datetime.now(timezone.utc).isoformat()
+    if path.exists():
+        owner = json.loads(path.read_text(encoding="utf-8"))
+        if owner.get("host") != host:
+            raise AlreadyRunning(f"{root} is the data store of collector host {owner.get('host')!r} (since "
+                                 f"{owner.get('claimed_at')}); this host is {host!r}. One store, one collecting host.")
+        owner["last_started_at"] = now
+    else:
+        owner = {"host": host, "data_root": str(root), "symbol": symbol, "claimed_at": now, "last_started_at": now}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(owner, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return owner
+
+
 def emit(message: str) -> None:
     print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}", flush=True)
 
@@ -69,6 +94,12 @@ def disk_check(root: Path, min_free_gb: float) -> float:
     if free < min_free_gb:
         raise RuntimeError(f"Disk free {free:.2f} GiB < required {min_free_gb:.2f} GiB: {root}")
     return free
+
+
+def clock_sync_hint(windows: bool | None = None) -> str:
+    if os.name == "nt" if windows is None else windows:
+        return "Windows Settings > Time & language > Date & time > Sync now, then retry."
+    return "Linux: check `timedatectl status` (System clock synchronized: yes) / `chronyc tracking`, then retry."
 
 
 def preflight(cfg, min_free_gb: float, clock_factory=None) -> dict:
@@ -100,7 +131,7 @@ def preflight(cfg, min_free_gb: float, clock_factory=None) -> dict:
     if not math.isfinite(skew) or abs(skew) > cfg.clock.max_abs_skew_ms:
         raise RuntimeError(
             f"Clock local-minus-Binance={skew:.1f} ms; limit={cfg.clock.max_abs_skew_ms:.1f} ms. "
-            "Windows Settings > Time & language > Date & time > Sync now, then retry."
+            + clock_sync_hint()
         )
     return {"data_root": str(root), "free_gib": round(free, 2), "clock_skew_ms": round(skew, 1)}
 
@@ -163,11 +194,22 @@ def keep_awake(enable: bool) -> bool:
 
 
 CHILD_BOOTSTRAP = (
-    "import signal; "
+    "import os, signal; "
     "getattr(signal, 'SIGBREAK', None) is not None and "
     "signal.signal(signal.SIGBREAK, signal.default_int_handler); "
+    # POSIX (systemd, docker, kill): SIGTERM takes the same graceful path as Ctrl+C (flush + checkpoint)
+    "os.name != 'nt' and signal.signal(signal.SIGTERM, signal.default_int_handler); "
     "from aqe.cli.main import main; raise SystemExit(main())"
 )
+
+
+def install_posix_term_handler(posix: bool | None = None) -> bool:
+    """On Linux a service manager stops processes with SIGTERM, whose default action skips every `finally`.
+    Map it to KeyboardInterrupt so the supervisor stops the child gracefully (flush + checkpoint) first."""
+    if not (os.name != "nt" if posix is None else posix):
+        return False
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    return True
 
 
 def spawn_collector(project: Path, config: Path, symbol: str, output, duration=None):
@@ -213,6 +255,7 @@ def supervise(cfg, args, project: Path, config: Path, symbol: str) -> int:
         if health.get("state") != "STOPPED" and health.get("status_age_seconds", math.inf) < 60:
             raise AlreadyRunning("An existing collector has a fresh status file. Stop that collector before using this launcher.")
     with DestinationLock(root / "status" / f"local_collect_{symbol}.lock"):
+        claim_data_root(root, symbol)
         checked = preflight(cfg, args.min_free_gb)
         emit("CHECK OK " + json.dumps(checked))
         awake = keep_awake(True)
@@ -302,6 +345,7 @@ def main(argv=None) -> int:
         if args.check:
             print(json.dumps(preflight(cfg, args.min_free_gb), indent=2), flush=True)
             return 0
+        install_posix_term_handler()
         return supervise(cfg, args, project, config, symbol)
     except KeyboardInterrupt:
         emit("STOPPED by user")

@@ -1,0 +1,6 @@
+# Linux deployment files must keep LF line endings on any checkout (deploy/linux, deploy/google).
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+deploy/linux/** text eol=lf
+deploy/google/** text eol=lf

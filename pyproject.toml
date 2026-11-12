@@ -34,7 +34,7 @@ where = ["src"]
 aqe = ["py.typed"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "local-collector/tests"]
 pythonpath = ["."]
 markers = [
   "network: requires public internet (Binance/GitHub); skipped unless AQE_NETWORK_TESTS=1",

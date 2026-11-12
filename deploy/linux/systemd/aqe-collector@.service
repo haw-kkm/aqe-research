@@ -1,0 +1,34 @@
+# Oracle 24/7 collector for one instrument: sudo systemctl enable --now aqe-collector@BTCUSDT
+# Runs the same supervisor as Windows (local-collector/collect_local.py): OS file lock (one collector per data_root),
+# disk + Binance clock preflight, child restart with backoff, graceful stop = flush + checkpoint.
+# Stop path: systemd sends SIGINT to the supervisor only (KillMode=mixed), the supervisor interrupts the child and
+# waits for the flush; SIGTERM is mapped to the same path. SIGKILL only after TimeoutStopSec.
+[Unit]
+Description=AQE public-data collector (%i)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=3600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=aqe
+Group=aqe
+EnvironmentFile=/etc/aqe/aqe.env
+WorkingDirectory=/opt/aqe/current
+ExecStartPre=/opt/aqe/current/.venv/bin/python -m aqe.ops preflight --config ${AQE_COLLECTOR_CONFIG} --role oracle-collector
+ExecStart=/opt/aqe/current/.venv/bin/python -u local-collector/collect_local.py --project-root /opt/aqe/current --config ${AQE_COLLECTOR_CONFIG} --instrument %i --min-free-gb ${AQE_MIN_FREE_GB}
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/aqe
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

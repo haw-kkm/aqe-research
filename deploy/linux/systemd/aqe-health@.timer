@@ -1,0 +1,11 @@
+# sudo systemctl enable --now aqe-health@BTCUSDT.timer
+[Unit]
+Description=AQE collector healthcheck every 5 minutes (%i)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

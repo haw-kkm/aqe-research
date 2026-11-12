@@ -8,3 +8,15 @@ __pycache__/
 /data/
 /artifacts/
 /runs/
+
+# secrets never belong in git (cloud deployment, docs/CLOUD_DEPLOYMENT.md)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+*credentials*.json
+aqe.env
+!deploy/linux/aqe.env.example

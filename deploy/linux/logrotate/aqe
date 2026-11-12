@@ -1,0 +1,11 @@
+# /etc/logrotate.d/aqe — supervisor/child logs. Raw market data is NOT rotated or deleted here (it is data).
+/srv/aqe/data/logs/local_collect/*.log /srv/aqe/data/logs/pipeline/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su aqe aqe
+}

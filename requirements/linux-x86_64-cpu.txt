@@ -1,0 +1,6 @@
+# Google Cloud CPU VM (Ubuntu x86-64, Python 3.12): dataset build, LightGBM, CPU TCN, OOS/meta/calibration, tests.
+# CPU-only torch from the PyTorch CPU index (the PyPI x86-64 wheel bundles CUDA libraries, ~2.5 GB more).
+# Status: wheel availability checked from index metadata by scripts/check_wheels.py — NOT yet installed on Linux.
+--extra-index-url https://download.pytorch.org/whl/cpu
+-r common.txt
+torch==2.15.0+cpu

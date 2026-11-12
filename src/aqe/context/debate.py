@@ -709,10 +709,9 @@ class DebateBackend:
         return list(exp.horizons_seconds)
 
     def _worker_python(self) -> Path | None:
-        p = self.cfg.context.tradingagents.worker_python
-        if p is None:
-            return None
-        return p if p.is_absolute() else self.root / p
+        from aqe.ops.platform import resolve_venv_python  # Scripts/python.exe <-> bin/python (Windows <-> Linux)
+
+        return resolve_venv_python(self.cfg.context.tradingagents.worker_python, self.root)
 
     def _settle(self, cost: float | None, calls: int | None) -> None:
         if self.queue is None or self._reservation is None:

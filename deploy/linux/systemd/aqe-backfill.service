@@ -1,0 +1,20 @@
+# Daily REST backfill on Oracle (public Binance REST, weight-limited): completed 5m klines, settled funding, OI
+# statistics into the same data store as the collector (upsert by key; the collector's 5m_live partition is separate).
+# Makes Oracle the single data source Google syncs for training. DISABLED by default:
+#   sudo systemctl enable --now aqe-backfill.timer
+[Unit]
+Description=AQE REST backfill (klines, funding, OI)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=aqe
+Group=aqe
+EnvironmentFile=/etc/aqe/aqe.env
+WorkingDirectory=/opt/aqe/current
+ExecStart=/opt/aqe/current/.venv/bin/python -m aqe.cli.main backfill --config ${AQE_COLLECTOR_CONFIG} --what klines,funding,oi
+TimeoutStartSec=3600
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/aqe

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import shutil
 import time
@@ -109,6 +110,10 @@ class Collector:
         self.oi_dir = root.joinpath("normalized", "oi_observations", *base)
         self.status_path = root / "status" / f"collector_{self.symbol}.json"
         self.ckpt_path = root / "status" / f"collector_{self.symbol}.checkpoint.json"
+        # durable, append-only record of every quality event (book desync/resync = unrecoverable depth gaps,
+        # disconnects, restarts, clock, REST failures); the status file only keeps the last few in memory
+        self.quality_dir = root.joinpath("quality", *base)
+        self._quality_pending: list[dict[str, Any]] = []
         self.load_checkpoint()
 
     # ------------------------------------------------------------------ clock
@@ -126,7 +131,27 @@ class Collector:
 
     # ------------------------------------------------------------------ quality
     def quality(self, kind: str, detail: str, **extra: Any) -> None:
-        self.quality_log.append({"at": iso_utc(self.corrected(self.now_local_ms())), "kind": kind, "detail": detail, **extra})
+        ev = {"at": iso_utc(self.corrected(self.now_local_ms())), "kind": kind, "detail": detail, **extra}
+        self.quality_log.append(ev)
+        self._quality_pending.append({**ev, "run_id": self.run_id, "instrument_id": self.symbol})
+
+    def flush_quality(self) -> None:
+        """Append pending quality events to `{data_root}/quality/<venue>/<market>/<symbol>/<UTC day>.jsonl` (fsync)."""
+        if not self._quality_pending:
+            return
+        events, self._quality_pending = self._quality_pending, []
+        self.quality_dir.mkdir(parents=True, exist_ok=True)
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for ev in events:
+            by_day.setdefault(ev["at"][:10], []).append(ev)
+        for day, evs in by_day.items():
+            p = self.quality_dir / f"{day}.jsonl"
+            with open(p, "a", encoding="utf-8", newline="\n") as fh:
+                for ev in evs:
+                    fh.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self.written_files.add(str(p))
 
     def _drain_book_quality(self) -> None:
         for q in self.book.drain_quality_events():
@@ -299,6 +324,7 @@ class Collector:
                 self.written_files.add(str(p))
         for w in self.raw.values():
             w.flush()
+        self.flush_quality()
 
     def save_checkpoint(self) -> None:
         atomic_write_json(self.ckpt_path, {

@@ -1,0 +1,60 @@
+# Google CPU training. IDENTICAL to configs/experiment.yaml except base_config (tests/test_cloud_ops.py enforces it).
+# Changing data paths does NOT make artifacts compatible by itself: promotion checks identity/schema/lineage.
+# Experiment configuration (B07, B09, B11). Segment boundaries are fixed BEFORE looking at results.
+schema_version: "1.0.0"
+experiment_id: exp_btcusdt_ohlcv_v0_001
+base_config: configs/cloud/google_cpu_train.yaml
+instrument: {venue: binance, market_type: usdm_perpetual, instrument_id: BTCUSDT}
+feature_profile: ohlcv_v0
+bar_interval_seconds: 300
+decision_delay_seconds: 10
+horizons_seconds: [3600, 86400]
+label:
+  kind: vol_scaled_3class
+  vol_window_bars: 288
+  cost_floor_bps: 10.0
+  target_neutral_fraction: 0.34      # k fitted on the initial training window only
+segments:
+  dev_start: "2019-09-15T00:00:00Z"
+  first_oos_start: "2022-01-01T00:00:00Z"   # walk-forward OOS folds inside dev
+  fold_months: 6
+  calibration_start: "2025-01-01T00:00:00Z" # independent calibration segment
+  test_start: "2025-07-01T00:00:00Z"        # locked final test segment
+  test_end: null                            # null = last matured label
+  embargo_seconds: 0
+lgbm:
+  num_boost_round: 2000
+  early_stopping_rounds: 100
+  val_fraction: 0.15
+  train_stride: 1
+tcn:
+  window: 256
+  channels: 32
+  levels: 6
+  kernel_size: 3
+  dilations: [1, 2, 4, 8, 16, 32]
+  dropout: 0.1
+  lr: 0.001
+  weight_decay: 0.0001
+  batch_size: 512
+  max_epochs: 10
+  patience: 2
+  grad_clip: 1.0
+  train_stride: 2
+  val_fraction: 0.15
+  max_train_samples: null
+  device: auto        # cuda if available, else cpu (CPU smoke supported)
+  num_threads: 6
+meta:
+  C: 0.5
+calibration:
+  method: temperature
+  min_independent_samples: 100
+evaluation:
+  taker_fee_bps: 5.0
+  slippage_bps: 2.0
+  policy_min_edge: 0.10
+  policy_min_prob: 0.40
+  bootstrap_block_hours: 72
+  bootstrap_samples: 500
+seed: 20261111

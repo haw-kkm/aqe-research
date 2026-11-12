@@ -1,0 +1,8 @@
+# Local alert hook for failed AQE units. Writes to the journal (`journalctl -t aqe-alert`) and, if the operator
+# created an executable /etc/aqe/alert.sh, calls it with the failed unit name. Nothing is sent anywhere by default.
+[Unit]
+Description=AQE alert hook for %i
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'logger -t aqe-alert "unit %i failed"; [ -x /etc/aqe/alert.sh ] && /etc/aqe/alert.sh "%i" || true'

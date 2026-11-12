@@ -1,0 +1,20 @@
+# Oracle shadow analysis (research report with the ACTIVE promoted models). DISABLED by default — enable only after
+# models were promoted (python -m aqe.ops release-activate) and REST 5m bars are kept current (G01: the collector's
+# 5m_live bars are not merged into analysis yet, so the unit refreshes REST klines first). No orders exist.
+[Unit]
+Description=AQE shadow analysis (research only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=aqe
+Group=aqe
+EnvironmentFile=/etc/aqe/aqe.env
+WorkingDirectory=/opt/aqe/current
+ExecStart=/opt/aqe/current/.venv/bin/python -m aqe.cli.main backfill --config ${AQE_SHADOW_CONFIG} --what klines
+ExecStart=/opt/aqe/current/.venv/bin/python -m aqe.cli.main analyze --config ${AQE_SHADOW_CONFIG}
+TimeoutStartSec=900
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/aqe

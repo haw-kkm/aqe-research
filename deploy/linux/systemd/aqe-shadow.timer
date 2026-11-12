@@ -1,0 +1,11 @@
+# sudo systemctl enable --now aqe-shadow.timer   (only after model promotion; see aqe-shadow.service)
+[Unit]
+Description=AQE shadow analysis every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

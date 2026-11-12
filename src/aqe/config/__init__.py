@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -289,20 +290,33 @@ def config_hash(obj: BaseModel) -> str:
     return hashlib.sha256(_canonical(obj).encode("utf-8")).hexdigest()
 
 
+_ENV_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}")
+
+
+def expand_env(text: str) -> str:
+    """`${VAR}` / `$VAR` from the environment, plus `${VAR:-default}` (default used when VAR is unset or empty).
+    Anything still unresolved raises — a path is never silently left as a literal `${...}`."""
+    expanded = _ENV_DEFAULT.sub(lambda m: os.environ.get(m.group(1)) or m.group(2), text)
+    expanded = os.path.expandvars(expanded)
+    if "${" in expanded or "%" in expanded:
+        raise ValueError(f"unresolved environment variable in path: {text}")
+    return expanded
+
+
 def _resolve_rel(p: Path | None, base: Path) -> Path | None:
     if p is None:
         return None
-    expanded = os.path.expandvars(str(p))
-    if "${" in expanded or "%" in expanded:
-        raise ValueError(f"unresolved environment variable in path: {p}")
-    p = Path(expanded)
+    p = Path(expand_env(str(p)))
     return p if p.is_absolute() else (base / p)
 
 
 def project_root_from(config_path: Path) -> Path:
-    # configs/<file>.yaml -> project root
+    # configs/<file>.yaml or configs/<group>/<file>.yaml -> project root (the parent of the nearest `configs` dir)
     cp = config_path.resolve()
-    return cp.parent.parent if cp.parent.name == "configs" else cp.parent
+    for parent in cp.parents:
+        if parent.name == "configs":
+            return parent.parent
+    return cp.parent
 
 
 def load_yaml(path: Path) -> dict[str, Any]:

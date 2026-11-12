@@ -62,3 +62,10 @@ the project contains no order client (T14).
   execution_enabled=false; the decision is WAIT unless the risk disposition is REVIEW_CANDIDATE and a committed
   real-LLM selection passes every check. Tick sizes come only from `{data_root}/imports/instrument_specs/` (none yet →
   `tick_size=UNKNOWN`).
+
+## Cloud deployment (docs/CLOUD_DEPLOYMENT.md, ADR-0015)
+- Ops CLI: `python -m aqe.ops {platform|inventory|transfer|transfer-rollback|sqlite-backup|sqlite-restore|release-build|
+  release-stage|release-verify|release-activate|release-rollback|health|preflight|cutover-compare|cutover-approve|
+  code-release-check}`. Transfers are dry-run unless `--execute`; activation/rollback need `--approve`.
+- Linux units: `deploy/linux/systemd/` (collector, 5-minute health timer, alert hook, shadow analysis — disabled by default).
+- Collector quality journal (new): `{data_root}/quality/<venue>/<market>/<symbol>/<UTC day>.jsonl` (append-only).

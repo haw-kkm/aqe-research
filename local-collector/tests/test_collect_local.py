@@ -16,6 +16,16 @@ lc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lc)
 
 
+def fake_aqe_package(src_root):
+    """Fixture `aqe.cli.main` as a REGULAR package: a namespace package would lose to an installed (e.g. editable)
+    `aqe`, and the child would run the real CLI instead of the fixture."""
+    package = src_root / "aqe" / "cli"
+    package.mkdir(parents=True)
+    (src_root / "aqe" / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    return package
+
+
 def config(tmp_path):
     return NS(paths=NS(data_root=tmp_path / "data"), binance=NS(), clock=NS(max_abs_skew_ms=1000))
 
@@ -124,8 +134,7 @@ def test_existing_direct_collector_is_not_started_again(tmp_path):
 def test_child_gets_graceful_interrupt_and_finishes_flush(tmp_path):
     # A real isolated child process exercises process group + signal delivery.
     # The fixture writes a flush marker on KeyboardInterrupt, as the real collector does.
-    package = tmp_path / "src/aqe/cli"
-    package.mkdir(parents=True)
+    package = fake_aqe_package(tmp_path / "src")
     (package / "main.py").write_text('''from pathlib import Path
 import time
 def main():
@@ -182,8 +191,7 @@ def test_windows_sleep_request_is_cleared(monkeypatch):
 
 def test_supervisor_restarts_failed_child_then_exits_bounded_run(tmp_path, monkeypatch):
     project = tmp_path / "project"
-    package = project / "src/aqe/cli"
-    package.mkdir(parents=True)
+    package = fake_aqe_package(project / "src")
     (package / "main.py").write_text('''from pathlib import Path
 def main():
     p=Path("attempts")

@@ -1,0 +1,5 @@
+# Oracle Cloud Ampere A1 (Ubuntu ARM64, Python 3.12, CPU only): collector + shadow/analyze inference.
+# torch from PyPI: its linux aarch64 wheels are CPU builds. Do NOT install requirements.lock here (Windows CUDA build).
+# Status: wheel availability checked from index metadata by scripts/check_wheels.py — NOT yet installed on ARM64.
+-r common.txt
+torch==2.15.0

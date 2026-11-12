@@ -1,0 +1,16 @@
+# Healthcheck run by aqe-health@.timer: python -m aqe.ops health (exit 1 WARN, 2 CRITICAL) appends to
+# {data_root}/ops/health.jsonl and the journal. A non-zero exit triggers aqe-alert@ (local hook, no external service).
+[Unit]
+Description=AQE collector healthcheck (%i)
+OnFailure=aqe-alert@%n.service
+
+[Service]
+Type=oneshot
+User=aqe
+Group=aqe
+EnvironmentFile=/etc/aqe/aqe.env
+WorkingDirectory=/opt/aqe/current
+ExecStart=/opt/aqe/current/.venv/bin/python -m aqe.ops health --config ${AQE_COLLECTOR_CONFIG} --record --min-free-gb ${AQE_MIN_FREE_GB}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/aqe
