@@ -1,6 +1,7 @@
-# AQE 클라우드 배포 — Oracle(상시 수집) + Google(필요 시 학습) · 데이터 이전
+# AQE 클라우드 배포 — Oracle(상시 수집) + Google(필요 시 학습) 또는 Google 단독 운영 · 데이터 이전
 
-작성 2026-11-12 · 개발 브랜치 `dev/cloud-deploy`(worktree `C:\vscode\aqe-dev`; `aadae59` → `5caee5f` trade plan → 클라우드 배포 커밋) · 결정 `docs/DECISIONS.md` ADR-0015.
+작성 2026-11-12, 갱신 2026-11-13 · 개발 브랜치 `dev/cloud-deploy-update`(worktree `C:\vscode\aqe-dev`; `aadae59` → `5caee5f` trade plan → `3589893` 클라우드 배포 → Google 단독 운영 커밋) · 결정 `docs/DECISIONS.md` ADR-0015, ADR-0016.
+**두 가지 배치를 지원한다**: (A) Oracle ARM64 수집 + Google 학습(§6~§13), (B) **Google 단독 운영** — Google x86-64 수집 VM(`google-collector`) + 필요할 때만 켜는 Google 학습 VM(§15).
 **이 문서의 절차는 로컬에서 만든 도구·설정·시험까지만 실행되었다.** 클라우드 서버 생성, 원격 배포, 실제 SSH 전송, ARM64·Linux·GPU 실행은
 하지 않았다(각 절 "검증 상태" 참고). 실거래 기능은 없고 추가하지 않는다: `RESEARCH_ONLY`·`approval_required=true`·`execution_enabled=false` 유지.
 
@@ -29,6 +30,7 @@
 | windows-dev | Windows, Python 3.12 | `configs/local.yaml` 등(기존 그대로) | `requirements.lock`(CUDA torch, Windows 전용) | 개발·현 수집기 |
 | oracle-collector | Ubuntu ARM64 A1(2 OCPU/12GB), 24시간 | `configs/cloud/oracle_collector.yaml` | `requirements/linux-arm64-cpu.txt` | WS depth/aggTrade/markPrice/kline + OI, 원본 저장, 호가 복원, 1분 흐름 요약 |
 | oracle-shadow | 같은 서버 | `configs/cloud/oracle_shadow.yaml` | 위와 같음 | 승격된 모델로 주기적 연구 분석(기본 비활성) |
+| google-collector | Google Compute Engine Ubuntu 24.04 x86-64, 24시간(§15) | `configs/cloud/google_collector.yaml` | `requirements/linux-x86_64-collector.txt`(기본, ML 없음) | Oracle 수집기와 같은 수집(설정 동일, 시험 강제). 학습 VM이 이 저장소를 가져감 |
 | google-cpu-train | Ubuntu x86-64, 필요 시만 | `configs/cloud/google_cpu_train.yaml` + `experiment_google.yaml` | `requirements/linux-x86_64-cpu.txt` | 데이터셋·LGBM·TCN(CPU)·OOS·메타·보정·평가·시험 |
 | google-gpu-train | x86-64 + NVIDIA, 필요 시만 | `configs/cloud/google_gpu_train.yaml` + `experiment_google_gpu.yaml` | `requirements/linux-x86_64-cuda.txt` | 위 + TCN CUDA |
 
@@ -47,6 +49,7 @@
 | linux-x86_64-cpu | 42/42 WHEEL | `torch-2.15.0+cpu …manylinux_2_28_x86_64.whl`(download.pytorch.org/whl/cpu) |
 | linux-x86_64-cuda | 42/42 WHEEL | `torch-2.15.0+cu132 …manylinux_2_28_x86_64.whl`(…/whl/cu132, CUDA 13.2 드라이버 필요) |
 | TradingAgents venv(arm64) | 85/85 WHEEL | `tradingagents`는 git 설치라 별도 확인 필요 |
+| linux-x86_64-collector (2026-11-13) | 24/24 WHEEL, pip dry-run(`manylinux_2_28/2_17_x86_64`, cp312, `--only-binary=:all:`) 24개 해석·버전 불일치 0 | 없음(수집기 전용) |
 manylinux_2_28 → glibc 2.28 이상(Ubuntu 22.04/24.04 충족). Python 3.12는 Ubuntu 24.04 기본. **ARM64·Linux에서 실제 설치·import·추론은 미검증.**
 기존 `requirements.lock`(Windows CUDA)은 서버에 설치하지 않는다.
 
@@ -67,8 +70,12 @@ manylinux_2_28 → glibc 2.28 이상(Ubuntu 22.04/24.04 충족). Python 3.12는 
 - 증가량 추정: 원본 WS ≈ 0.4 GiB/일(약 42시간 0.72 GiB) → 연 ≈ 150 GiB. Oracle 디스크 경보(§9)와 보관 계획 필요.
 
 ## 5. 데이터 이전 도구 (`python -m aqe.ops transfer`)
-- 방향: Windows→Oracle(push), Windows→Google(push), Oracle→Google(Google에서 pull), Google→Oracle은 모델 릴리스(§7)로.
+- 방향: Windows→Oracle(push), Windows→Google(push, 수집 VM 포함), Oracle→Google 학습 VM(pull), **Google 수집 VM→Google 학습 VM(pull, §15)**,
+  Oracle→Google 수집 VM(저장소 이전), Google→Oracle은 모델 릴리스(§8)로.
   한쪽만 원격(`ssh://user@host/절대경로`), 원격 쪽은 같은 코드의 `python -m aqe.ops transfer-*`를 실행한다(`/opt/aqe/bin/aqe-python`).
+  추가 SSH 옵션은 `--ssh-option KEY=VALUE`(반복 가능, ssh·scp에 모두 `-o`로 전달, 공백 없는 KEY=VALUE만 허용).
+- 원격 명령은 `aqe` 계정의 로그인 셸로 실행된다. **이전 버전 `bootstrap_host.sh`는 `aqe`를 `/usr/sbin/nologin`으로 만들어 모든 SSH 전송이 첫 실행에서
+  실패하는 결함이 있었다(2026-11-13 수정)**: 이제 `/bin/bash` + 비밀번호 없음(키 전용 로그인), `/home/aqe/.ssh/authorized_keys`(빈 파일, 덮어쓰지 않음).
 - **기본은 DRY-RUN**(계획만), 실제 전송은 `--execute`.
 - 단계: manifest(SHA-256) → 계획(대상에 없으면 COPY, 같은 해시면 SKIP, 다르면 CONFLICT) → `_transfer/<id>/incoming/`로 복사·해시 재검증(불일치 1회 재시도)
   → 대상이 여전히 없을 때만 배치(덮어쓰기 없음) → journal·receipt·`_transfer/transfers.jsonl`(전송량 기록).
@@ -77,7 +84,10 @@ manylinux_2_28 → glibc 2.28 이상(Ubuntu 22.04/24.04 충족). Python 3.12는 
 - 기록 중 파일 제외: `*.open`, 현재 파티션, 최근 15분 내 수정 파일, 오늘자 품질 일지. 호스트 전용(status/checkpoint/lock, `_transfer/`) 제외.
 - SQLite: 원본을 SQLite로 열지 않는다(읽기 전용 연결도 WAL 보조 파일을 만들기 때문). DB와 기존 `-wal`을 임시 폴더로 복사(연속 2회 동일할 때까지)한 뒤 백업 API·`integrity_check`.
   대상에는 `_transfer/<id>/sqlite/…`로만 놓이고 운영 DB 경로에 자동으로 들어가지 않는다 → 필요 시 `sqlite-restore`(새 경로만).
-- 모드: `--mode safe`(기본, Windows→Oracle: 절대 교체 안 함) / `--mode mirror`(Oracle→Google 복제: 지난번 받은 그대로인 파일만 새 버전으로 갱신, 이전 버전 보관). 겹친 수집기 파티션 합치기는 `transfer-merge`(§13.5).
+- 모드: `--mode safe`(기본, Windows→수집 서버: 절대 교체 안 함) / `--mode mirror`(수집 서버→학습 VM 복제: 지난번 **같은 저장소**에서 받은 그대로인 파일만 새 버전으로 갱신, 이전 버전 보관). 겹친 수집기 파티션 합치기는 `transfer-merge`(§13.5).
+- 저장소 ID(2026-11-13): 수집기 감독자가 처음 시작할 때 `status/data_store.json`(무작위 ID, 한 번만 생성, 전송 안 됨)을 만든다. 미러 모드의 "같은 출처"는 이 ID로 판정한다:
+  같은 저장소를 새 주소로 가져와도 계속 갱신되고, 같은 주소 뒤의 **다른 저장소**(VM 재생성, Oracle→Google 수집기 교체)에서 자란 파티션은 충돌로 보관된다. ID가 없는 저장소(기존 Windows 수집기)는 종전처럼 주소로 판정.
+- `transfer-merge --execute`로 합친 들어온 버전은 `received_index.json`에 `absorbed`로 기록되어, 다음 전송에서 **같은 버전이 다시 충돌로 보관되지 않고** `SKIP_MERGED`로 건너뛴다(새 버전은 다시 충돌).
 - 중단·재개: 같은 `--transfer-id`로 다시 실행하면 검증된 incoming 파일은 다시 복사하지 않는다. 롤백: `transfer-rollback`(기본 DRY-RUN)이
   이 전송이 배치한 파일 중 그 뒤 바뀌지 않은 것만 `_transfer/<id>/rolled_back/`으로 **이동**(삭제 없음). 원본은 항상 읽기만 한다.
 
@@ -125,7 +135,9 @@ sudo -u aqe bash /opt/aqe/repo/deploy/linux/install_release.sh <같은 커밋> g
 sudo -u aqe bash /opt/aqe/current/deploy/google/sync_from_oracle.sh aqe@<ORACLE_IP>              # 계획(미러 모드, §13.6)
 sudo -u aqe bash /opt/aqe/current/deploy/google/sync_from_oracle.sh aqe@<ORACLE_IP> --execute    # 증분 가져오기
 sudo -u aqe bash /opt/aqe/current/deploy/google/train_pipeline.sh --role google-cpu-train --shutdown-after
+# 또는 동기화부터 한 번에: --sync-from aqe@<수집 호스트> (완료·충돌 0일 때만 학습 시작, §15)
 ```
+- `sync_from_oracle.sh`는 이제 범용 `sync_from_collector.sh`(Oracle·Google 수집 VM 공용)를 호출하는 호환용 래퍼다.
 - 단계: build-dataset → train-lgbm → train-tcn → build-oos → train-meta → calibrate. **evaluate(잠금 시험 구간, 시도 번호 증가)는 `--allow-locked-evaluate`일 때만.**
 - 재개: 같은 `--run-id`로 다시 실행하면 같은 커밋·설정 해시로 끝난 단계는 건너뛰고, 한 단계라도 다시 돌면 뒤 단계는 모두 다시 돈다.
 - **단계 내부 체크포인트는 없다**(TCN은 최적 epoch를 메모리에만 보관) → 중단된 단계는 처음부터. 따라서 Spot/선점형 VM은 epoch 체크포인트를 구현·시험하기 전에는 권하지 않는다.
@@ -183,6 +195,8 @@ sudo -u aqe bash /opt/aqe/current/deploy/google/train_pipeline.sh --role google-
 ## 12. 실행하지 못한 것 (완료로 보고하지 않음)
 ARM64·Linux에서 설치/시험/추론, Google CPU·GPU 실행, 실제 SSH 전송, systemd 유닛 동작, Linux SIGTERM 경로의 실제 프로세스 시험,
 클라우드에서 Binance 연결·시계, Spot 중단 복구, 실제 전환. 이들은 위 절차의 각 단계에서 서버별로 확인해야 한다.
+Google 단독 운영(§15)의 미실행 항목: Google VM에서 `bootstrap_host.sh`·`install_release.sh`(x86-64 수집기 전용 환경 실제 설치·시험), 선택한 Google 리전에서 Binance REST·WS 접속과 시계,
+`aqe` 키 전용 SSH 로그인(`/bin/bash` 셸, 잠긴 비밀번호, `restrict` 키 옵션)과 VM 간 실제 ssh/scp 전송, 데이터 디스크 마운트 판정, e2-micro/e2-small 메모리 여유, systemd 정지 경로.
 
 ## 13. 수집기 클라우드 이전 상세 (2026-11-12 추가 요구 반영)
 ### 13.1 현재 수집기가 저장하는 정확한 위치 (원본 읽기 전용 확인, main `1785160`)
@@ -252,7 +266,7 @@ ML 라이브러리 설치가 ARM에서 문제면 수집기 전용 환경: `AQE_R
    기존 Oracle 행은 그대로, 합치기 전 파일은 `merge_backup/`, 쓰는 중인 파일은 보류. 7. `cutover-approve`로 결정 기록. 8. Windows `E:\aqe-v2`는 백업으로 보존(삭제하지 않음).
 
 ### 13.6 Google 학습 서버와의 연동
-- Google VM이 켜질 때 `deploy/google/sync_from_oracle.sh aqe@<ORACLE> [--execute]` → `transfer --mode mirror`(Oracle→Google pull).
+- Google VM이 켜질 때 `deploy/google/sync_from_oracle.sh aqe@<ORACLE> [--execute]`(= `sync_from_collector.sh`) → `transfer --mode mirror`(Oracle→Google pull).
   새 파일은 복사, 같은 내용은 건너뜀, **Oracle에서 자란 파티션은 Google이 지난번에 받은 그대로일 때만 갱신**(이전 버전 `replaced/` 보관), Google에서 바뀐 파일은 충돌로 보존.
   수신 이력 `/srv/aqe/data/_transfer/received_index.json`. Oracle은 Google이 꺼져 있어도 계속 수집한다(Oracle 쪽 작업 없음).
 - 학습용 5분봉: Oracle `aqe-backfill.timer`(선택)가 REST 봉을 Oracle 저장소에 갱신 → 미러 동기화로 Google에 반영. (또는 Google에서 직접 `aqe backfill`.)
@@ -272,3 +286,94 @@ systemd 실제 시작/정지(SIGINT 경로) 확인 · Windows→Oracle 실제 SS
 | 병합 시 원본 보존 | PC 원본·충돌 보관 사본 SHA-256 불변, 합치기 전 대상 파일은 `merge_backup/`, 쓰는 중이면 보류(시험) | 실제 겹침 데이터로 DRY-RUN 먼저 |
 | 중복 행과 겹친 구간 구분 | 수집기 키 기준: 같은 키 = 중복(대상 행 유지, 동일/상이 건수 보고), 다른 키 = 새 행 추가, 파일 내부 중복 제거, 시간 단위(ns/us) 정규화, 시간대 없는 키는 자동 병합 거부(시험). OI는 키가 수신 시각이라 두 호스트의 관측이 모두 남는다(서로 다른 관측) | — |
 | 기존 모델·평가 무변경 | 모델·학습·평가·위험 코드·실험 설정 diff 0, 원본 artifacts 106개·기록 105개 해시 동일 | — |
+
+## 15. Google Cloud 단독 운영 (`google-collector`, 2026-11-13 추가)
+Oracle 없이 Google에서만 운영하는 배치. 같은 커밋·같은 코드이고 역할(설정·의존성·사전 점검)만 다르다. 실거래·주문 기능은 없다.
+
+| VM | 역할 | 사양(사용자 결정, 권장) | 상시 |
+|---|---|---|---|
+| 수집 VM | `google-collector` | Ubuntu 24.04 x86-64. **초기 후보 e2-medium(4 GB)**(전체 CPU 환경을 같이 설치해 추론까지 할 여유). 최소 e2-small(2 GB); e2-micro(1 GB)는 2 GiB 스왑을 두라(사전 점검이 RAM < 1.5 GiB이고 스왑이 부족하면 WARN). **데이터용 영구 디스크를 `/srv/aqe`에 별도 마운트**(VM을 다시 만들어도 데이터 유지; 원본 ≈ 0.4 GiB/일 → 100 GB면 약 7개월) | 24시간 |
+| 학습 VM | `google-cpu-train` / `google-gpu-train` | §7과 같음 | 학습할 때만(`--shutdown-after`) |
+
+참고: 이 PC에서 실행 중인 수집기 자식 프로세스의 메모리는 작업 집합 113 MB(최대 154 MB, Windows 측정 — Linux 실측 아님).
+
+**지역 — 가장 큰 위험.** Binance는 제한 지역(미국 등)의 접속을 거부한다(HTTP 451). Google 무료 등급 e2-micro는 미국 일부 리전 한정이므로 그대로는 수집에 쓸 수 없을 가능성이 높다
+(현재 무료 조건은 Google 요금 페이지에서 확인). 수집 VM은 Binance가 허용하는 리전에 둔다. 설치 단계의 사전 점검은 HTTP 451이면 "지역 차단", 403이면 "방화벽(WAF) 규칙 또는 지역 차단"으로 표시하고 FAIL → 서비스가 시작되지 않는다.
+학습 VM은 수집 VM과 **같은 리전·영역, 같은 VPC의 내부 IP**로 연결하면 네트워크 요금이 가장 적다(요금표 확인).
+
+### 15.1 수집 VM 설치 (관리자 계정)
+```bash
+# 0) (사용자) 데이터 영구 디스크를 만들고 연결 → Google 문서 절차대로 /srv/aqe에 마운트(fstab, nofail). 새 빈 디스크일 때만 포맷.
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/haw-kkm/aqe-research.git ~/aqe-boot && git -C ~/aqe-boot checkout <40자리 커밋>
+sudo bash ~/aqe-boot/deploy/linux/bootstrap_host.sh google-collector       # /etc/aqe/aqe.env: AQE_ROLE=google-collector, google_collector.yaml, AQE_MIN_FREE_GB=10
+sudo -u aqe git clone https://github.com/haw-kkm/aqe-research.git /opt/aqe/repo
+sudo -u aqe bash /opt/aqe/repo/deploy/linux/install_release.sh <40자리 커밋> google-collector   # 수집기 전용 venv·시험 부분집합·사전 점검
+sudo cp /opt/aqe/current/deploy/linux/systemd/aqe-{collector@.service,health@.service,health@.timer,alert@.service} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start aqe-collector@BTCUSDT && journalctl -u aqe-collector@BTCUSDT -n 50   # 먼저 시작만
+sudo systemctl stop aqe-collector@BTCUSDT     # 정지 경로 실측: status의 "final": true, *.open 0, checkpoint 갱신 확인
+sudo systemctl enable --now aqe-collector@BTCUSDT aqe-health@BTCUSDT.timer
+sudo systemctl enable --now aqe-backfill.timer   # (선택) REST 5분봉·funding·OI 매일 갱신 — 수집기 전용 환경에서 동작(ML import 없음, 시험)
+```
+- `install_release.sh google-collector`의 기본 의존성은 `requirements/linux-x86_64-collector.txt`(torch·LightGBM·sklearn·SciPy 없음). 다른 CPU용 파일은 거부한다
+  (`linux-arm64-*`를 x86-64에 설치 불가). `AQE_ROLE`이 `/etc/aqe/aqe.env`와 다르거나 없으면 전환하지 않는다.
+- 수집기 유닛은 Oracle과 같은 `aqe-collector@.service`이고, `ExecStartPre`가 `preflight --role ${AQE_ROLE}`를 실행한다.
+  google-collector 사전 점검: Python 3.12, x86-64, 경로 쓰기·여유 공간(10 GiB), **데이터 디스크 분리(부트 디스크와 같으면 WARN)**, **메모리**, import(ML 제외),
+  같은 저장소의 다른 수집기, 시간 동기화(Google 이미지의 chrony는 `metadata.google.internal` 사용), **Binance REST·시계 오차**(오프라인 생략 불가, 지역 차단 판별).
+- 방화벽: 외부 인바운드는 SSH만(본인 IP 또는 IAP). 학습 VM → 수집 VM의 tcp:22 내부 허용(기본 VPC는 `default-allow-internal`, 사용자 VPC는 규칙 추가).
+- shadow 분석은 이 배치에서 기본 비활성: 수집 VM에는 ML 라이브러리가 없다(필요하면 전체 환경 VM에서 따로 결정).
+
+### 15.2 학습 VM ← 수집 VM 동기화 (`deploy/google/sync_from_collector.sh`)
+```bash
+# 학습 VM
+sudo bash ~/aqe-boot/deploy/linux/bootstrap_host.sh google-cpu-train        # 끝에 pull 키(공개 키)와 authorized_keys 한 줄 예시 출력
+sudo -u aqe git clone https://github.com/haw-kkm/aqe-research.git /opt/aqe/repo
+sudo -u aqe bash /opt/aqe/repo/deploy/linux/install_release.sh <같은 커밋> google-cpu-train
+# 수집 VM: 학습 VM의 공개 키를 한 줄 추가(학습 VM 내부 IP만, 포워딩·pty 금지)
+echo 'from="<학습VM 내부 IP>",restrict ssh-ed25519 AAAA... aqe-pull@<학습VM>' | sudo -u aqe tee -a /home/aqe/.ssh/authorized_keys
+# 학습 VM: 첫 연결에서 호스트 키 기록 + 계획(DRY-RUN) → 실행
+sudo -u aqe bash /opt/aqe/current/deploy/google/sync_from_collector.sh aqe@<수집VM 내부 IP 또는 내부 DNS> --accept-new-hostkey
+sudo -u aqe bash /opt/aqe/current/deploy/google/sync_from_collector.sh aqe@<수집VM> --execute
+# 학습: 동기화(완료·충돌 0)부터 → 단계 실행 → 끝나면 VM 정지
+sudo -u aqe bash /opt/aqe/current/deploy/google/train_pipeline.sh --role google-cpu-train --sync-from aqe@<수집VM> --shutdown-after
+```
+- 미러 모드: 새 파일 복사, 같은 내용 건너뜀, 수집 VM에서 자란 파티션은 학습 VM이 **같은 저장소(`status/data_store.json`)에서** 지난번 받은 그대로일 때만 갱신(이전 버전 `replaced/`),
+  나머지는 `conflicts/`에 보관. 완료 파일만(15분 이상 안 바뀜, `*.open` 제외), `status/`·`_transfer/`는 오가지 않는다. 수집 VM은 계속 수집한다.
+- 수집 VM 쪽에서는 `aqe-python -m aqe.ops transfer-manifest/-index`만 실행된다(원본은 읽기만; SQLite가 있으면 사본만 `_transfer/<id>/source_snapshots`에).
+  이 경로가 수집기 전용 환경(ML 없음)에서 동작함을 시험으로 확인했다.
+- `train_pipeline.sh --sync-from`: 동기화 영수증이 `complete: true`이고 충돌이 0일 때만 학습을 시작한다(아니면 exit 6, 학습 VM에 `--shutdown-after`가 있으면 정지).
+
+### 15.3 기존 데이터 이전과 전환
+- **Windows → 수집 VM**: §5 명령에서 대상만 `--dest ssh://aqe@<수집VM>/srv/aqe/data`(safe, DRY-RUN 먼저). 병행 ≥ 24시간 → `cutover-compare` → GO →
+  `cutover-approve --reference windows` → 사용자가 Windows 창에서 Ctrl+C → 최종 증분 → `transfer-merge`(§13.5와 같은 순서).
+- **Oracle → Google 수집 VM**(Oracle을 이미 운영 중일 때): Google 수집기를 별도 저장소로 시작(Oracle 계속) → 수집 VM에서
+  `python -m aqe.ops transfer --source ssh://aqe@<ORACLE>/srv/aqe/data --dest /srv/aqe/data --kind data`(safe) → 병행 ≥ 24시간 → `cutover-compare --ref-root <Oracle 사본> --new-root <Google 사본>` →
+  `cutover-approve --reference linux`(다음 단계로 Oracle의 `systemctl disable --now aqe-collector@BTCUSDT` 안내) → **사용자 승인 후** 그 명령 실행 → 최종 증분 → `transfer-merge`.
+  수집 VM에는 bootstrap이 키를 만들지 않으므로 이 경우만 `sudo -u aqe ssh-keygen -t ed25519 -N '' -f /home/aqe/.ssh/id_ed25519`로 만들어 Oracle `authorized_keys`에 추가한다.
+- 학습 VM이 그동안 Oracle에서 받아 왔다면, 출처를 Google 수집 VM으로 바꾸는 순간 저장소 ID가 달라 겹친 시간 파티션은 **덮어쓰지 않고 충돌로 보관**된다 →
+  학습 VM에서 `transfer-merge`(DRY-RUN → `--execute`) 한 번. 합친 버전은 다음 동기화에서 `SKIP_MERGED`로 건너뛴다.
+- 어떤 도구도 수집기를 멈추거나 데이터를 지우지 않는다. Windows `E:\aqe-v2`와 Oracle 저장소는 검증이 끝날 때까지 보존.
+
+### 15.3b 모델 릴리스 (Google 단독 운영)
+학습 VM에서 만든 모델은 §8과 같은 승인 절차로만 옮긴다(자동 배포 없음, 재학습·평가 기준 변경 없음).
+1. 학습 VM: `release-build --artifact-root /srv/aqe/artifacts --experiment <id> --out /srv/aqe/releases`.
+2. 모델을 읽을 호스트(학습 VM 자체, 또는 전체 환경으로 설치한 VM)로 `transfer --kind release`(DRY-RUN → `--execute`).
+   수집 VM에서 추론하려면 그 VM을 `AQE_REQUIREMENTS=requirements/linux-x86_64-cpu.txt install_release.sh <sha> google-collector`로 전체 환경 설치(e2-medium 권장, 미실측).
+3. 그 호스트에서 `release-stage` → `release-verify --experiment-config configs/cloud/experiment_google.yaml`(무결성·누수·현 서버 추론·위험 엔진) → `release-activate --approve <rid>` → 문제 시 `release-rollback --approve <백업>`.
+모든 출력은 연구용: `RESEARCH_ONLY`, `approval_required=true`, `execution_enabled=false`.
+
+### 15.4 비용·운영 메모
+- 수집 VM과 데이터 디스크는 상시 과금 대상이다(무료 등급 조건 밖이면). 학습 VM은 `--shutdown-after`로 정지. 콘솔 Billing → Budgets 알림은 사용자가 설정.
+- 디스크: `AQE_MIN_FREE_GB=10` — 여유가 10 GiB 미만이면 헬스체크 WARN이고 수집기는 시작·계속을 멈춘다(Oracle의 20 GiB와 같은 방식). 디스크 크기는 보관 계획에 맞춰 사용자가 정한다.
+- 이 작업은 클라우드 자원을 만들지 않았고, 유료 서비스를 켜지 않았으며, GitHub에 push하지 않았다.
+
+### 15.5 검증 상태 (이 PC에서 실행한 것만)
+| 항목 | 결과 | 남은 실측 |
+|---|---|---|
+| 역할 연결(설정·의존성·bootstrap·install·유닛·env) | `tests/test_collector_host.py`가 스크립트의 역할 표와 `aqe.ops.platform`을 대조(모든 Linux 역할, CPU 일치) | Google VM에서 실제 bootstrap·install |
+| 설정 | `google_collector.yaml` = `oracle_collector.yaml`(분석 실험 참조 한 줄만 다름), 수집 항목은 Windows `local.yaml`과 동일(시험) | — |
+| 의존성 | `check_wheels.py` 24/24 WHEEL, pip dry-run x86-64 cp312 24개 wheel만으로 해석·버전 불일치 0, ML 패키지 0 | 실제 `pip install`·import |
+| 사전 점검 | 지역 차단(HTTP 451) 문구, 메모리·스왑, 데이터 디스크, `AQE_ROLE` 불일치 FAIL, 오프라인 FAIL, 역할 누락 시 CLI 안내(시험) | 실제 리전에서 Binance·시계 |
+| 동기화 | 저장소 ID 기준 미러(주소 변경 = 갱신, 다른 저장소 = 충돌), 합친 버전 건너뜀, SSH 옵션 전달·검증, 가짜 ssh/scp로 수집 VM→학습 VM pull, ML 없는 수집 VM 쪽 명령(시험) | VM 간 실제 SSH |
+| 기존 기능 | 전체 시험(아래 RESUME_DEV), Windows·Oracle·Google 학습 시험 유지 | — |

@@ -1,4 +1,5 @@
-"""Collector cutover gate: Windows PC -> Oracle (docs/CLOUD_DEPLOYMENT.md §수집기 전환).
+"""Collector cutover gate: Windows PC -> cloud collector (Oracle or Google), or Oracle -> Google collector
+(docs/CLOUD_DEPLOYMENT.md §10, §15).
 
 Runs both collectors in parallel on SEPARATE data roots, then compares the overlap window minute by minute from the
 stored flow summaries: coverage (minutes with a row), order-book-valid minutes and trade counts. `readiness` turns
@@ -86,9 +87,18 @@ def write_report(out: Path, comparison: dict[str, Any], ready: dict[str, Any]) -
     return rep
 
 
-def approve(report_path: Path, approve_id: str | None, migration_receipt: Path) -> dict[str, Any]:
+STOP_STEPS = {
+    "windows": "stop the Windows collector window with Ctrl+C (it flushes), keep its data as a backup",
+    "linux": "on the replaced Linux collector host run `sudo systemctl disable --now aqe-collector@<SYMBOL>` "
+             "(SIGINT -> flush + checkpoint), keep its data as a backup until the final incremental transfer is verified",
+}
+
+
+def approve(report_path: Path, approve_id: str | None, migration_receipt: Path, *, reference: str = "windows") -> dict[str, Any]:
     """Record the operator's decision. Requires a GO report, the matching id, and a COMPLETE transfer receipt
-    (Windows history migrated). Writes cutover_approved.json next to the report. Stops nothing."""
+    (history of the replaced collector migrated). Writes cutover_approved.json next to the report. Stops nothing."""
+    if reference not in STOP_STEPS:
+        raise ValueError(f"reference must be one of {sorted(STOP_STEPS)}")
     rep = json.loads(Path(report_path).read_text(encoding="utf-8"))
     if approve_id != rep["report_id"]:
         raise PermissionError(f"approval must name the report: --approve {rep['report_id']}")
@@ -99,7 +109,7 @@ def approve(report_path: Path, approve_id: str | None, migration_receipt: Path) 
         raise PermissionError("data migration receipt is not complete")
     rec = {"approved_report": rep["report_id"], "approved_at": datetime.now(timezone.utc).isoformat(),
            "migration_transfer_id": receipt.get("transfer_id"),
-           "next_manual_step": "stop the Windows collector window with Ctrl+C (it flushes), keep its data as a backup"}
+           "reference_collector": reference, "next_manual_step": STOP_STEPS[reference]}
     p = Path(report_path).with_name("cutover_approved.json")
     if p.exists():
         raise FileExistsError(f"{p} already exists")

@@ -1,4 +1,7 @@
-# Oracle 24/7 collector for one instrument: sudo systemctl enable --now aqe-collector@BTCUSDT
+# 24/7 collector for one instrument on the collector host (Oracle ARM64 or Google x86-64):
+#   sudo systemctl enable --now aqe-collector@BTCUSDT
+# The role comes from /etc/aqe/aqe.env (AQE_ROLE=oracle-collector | google-collector) and selects the preflight checks;
+# AQE_COLLECTOR_CONFIG selects configs/cloud/<role>.yaml. A missing AQE_ROLE makes preflight fail (unit does not start).
 # Runs the same supervisor as Windows (local-collector/collect_local.py): OS file lock (one collector per data_root),
 # disk + Binance clock preflight, child restart with backoff, graceful stop = flush + checkpoint.
 # Stop path: systemd sends SIGINT to the supervisor only (KillMode=mixed), the supervisor interrupts the child and
@@ -16,7 +19,7 @@ User=aqe
 Group=aqe
 EnvironmentFile=/etc/aqe/aqe.env
 WorkingDirectory=/opt/aqe/current
-ExecStartPre=/opt/aqe/current/.venv/bin/python -m aqe.ops preflight --config ${AQE_COLLECTOR_CONFIG} --role oracle-collector
+ExecStartPre=/opt/aqe/current/.venv/bin/python -m aqe.ops preflight --config ${AQE_COLLECTOR_CONFIG} --role ${AQE_ROLE}
 ExecStart=/opt/aqe/current/.venv/bin/python -u local-collector/collect_local.py --project-root /opt/aqe/current --config ${AQE_COLLECTOR_CONFIG} --instrument %i --min-free-gb ${AQE_MIN_FREE_GB}
 KillMode=mixed
 KillSignal=SIGINT

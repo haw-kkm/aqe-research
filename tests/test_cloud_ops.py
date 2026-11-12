@@ -53,6 +53,7 @@ def test_env_defaults_and_unresolved_paths(monkeypatch):
 
 
 @pytest.mark.parametrize("name,mode,exp", [("oracle_collector", "research", "experiment_oracle"), ("oracle_shadow", "shadow", "experiment_oracle"),
+                                           ("google_collector", "research", "experiment_google"),
                                            ("google_cpu_train", "research", "experiment_google"),
                                            ("google_gpu_train", "research", "experiment_google_gpu")])
 def test_role_configs_load_with_server_paths(monkeypatch, tmp_path, name, mode, exp):
@@ -77,7 +78,7 @@ def test_cloud_experiments_equal_the_original_except_base_config(exp):
 
 def test_role_configs_keep_collector_settings_identical_to_windows():
     local = yaml.safe_load((ROOT / "configs" / "local.yaml").read_text(encoding="utf-8"))
-    for name in ("oracle_collector", "oracle_shadow", "google_cpu_train", "google_gpu_train"):
+    for name in ("oracle_collector", "oracle_shadow", "google_collector", "google_cpu_train", "google_gpu_train"):
         c = yaml.safe_load((CLOUD / f"{name}.yaml").read_text(encoding="utf-8"))
         for key in ("instruments", "binance", "backfill", "collector", "database", "clock", "risk_ruleset"):
             assert c[key] == local[key], (name, key)
@@ -679,8 +680,9 @@ def test_the_collect_path_imports_no_ml_library(tmp_path):
     r = subprocess.run([sys.executable, "-c", NO_ML_SCRIPT, str(tmp_path), str(ROOT / "local-collector" / "collect_local.py")],
                        capture_output=True, text=True, cwd=ROOT, timeout=120)
     assert r.returncode == 0 and r.stdout.strip().endswith("OK"), r.stderr[-800:]
-    pins = (ROOT / "requirements" / "linux-arm64-collector.txt").read_text(encoding="utf-8").lower()
-    assert all(f"\n{m}==" not in pins for m in ("torch", "lightgbm", "scikit-learn", "scipy"))
+    for name in ("linux-arm64-collector.txt", "linux-x86_64-collector.txt"):
+        pins = (ROOT / "requirements" / name).read_text(encoding="utf-8").lower()
+        assert all(f"\n{m}==" not in pins for m in ("torch", "lightgbm", "scikit-learn", "scipy")), name
 
 
 def test_one_data_store_one_collecting_host(tmp_path):

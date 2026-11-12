@@ -1,0 +1,67 @@
+# ROLE google-collector (Google Cloud Compute Engine, Ubuntu 24.04 x86-64, 24/7): public Binance collection only
+# (WS depth/aggTrade/markPrice/kline + OI polling) for Google-only operation; the Google training VM pulls this store
+# (deploy/google/sync_from_collector.sh). No training, no LLM, no orders. Same unit as Oracle:
+# deploy/linux/systemd/aqe-collector@.service with AQE_ROLE=google-collector in /etc/aqe/aqe.env.
+# Collection settings are identical to oracle_collector.yaml and configs/local.yaml (tests enforce it).
+# Paths: AQE_DATA_ROOT / AQE_ARTIFACT_ROOT (defaults /srv/aqe/..., a separate persistent disk). docs/CLOUD_DEPLOYMENT.md §15
+schema_version: "1.0.0"
+mode: research
+paths:
+  data_root: "${AQE_DATA_ROOT:-/srv/aqe/data}"          # override per server via /etc/aqe/aqe.env
+  artifact_root: "${AQE_ARTIFACT_ROOT:-/srv/aqe/artifacts}"
+instruments:
+  - {venue: binance, market_type: usdm_perpetual, instrument_id: BTCUSDT}
+binance:
+  rest_base_url: "https://fapi.binance.com"
+  ws_public_base: "wss://fstream.binance.com/public"   # depth / bookTicker (2026 path split)
+  ws_market_base: "wss://fstream.binance.com/market"   # aggTrade / markPrice / kline
+  http_timeout_seconds: 10
+  max_retries: 6
+  max_weight_per_minute: 1200
+backfill:
+  kline_interval: "5m"
+  start: "2019-09-08T00:00:00Z"
+  end: null                       # null = up to the last completed bar
+  assumed_latency_seconds: 2.0    # ASSUMED_LATENCY_REPLAY: available_at = bar close + this
+  funding_history: true
+  oi_hist: true
+  oi_hist_period: "5m"
+collector:
+  depth_speed: "100ms"
+  snapshot_limit: 1000
+  rotate_max_mb: 64
+  rotate_max_minutes: 60
+  status_interval_seconds: 15
+  oi_poll_seconds: 60
+  flow_summary_seconds: 60
+  clock_check_seconds: 300
+database:
+  postgres_dsn_env: AQE_PG_DSN
+  sqlite_relpath: "meta/aqe_meta.sqlite"
+clock:
+  max_abs_skew_ms: 1000
+context:
+  backend: none                   # none | offline_fixture | simple_llm | tradingagents
+  ttl_seconds: 1800
+  lease_seconds: 900
+  job_timeout_seconds: 600
+  max_attempts: 2
+  concurrency: 1
+  max_calls_per_day: 200
+  max_cost_usd_per_day: 0.0       # 0 => paid LLM calls are refused
+  llm:
+    provider: null
+    model_id: null
+    api_key_env: null
+    temperature: 0.0
+  tradingagents:
+    upstream_sha: "9fa1196fffbcfd9de5146d2dd2869df84ab99838"
+    worker_python: ".venv-ta/bin/python"   # resolve_venv_python also maps Scripts/python.exe <-> bin/python
+    selected_analysts: ["market", "news"]
+    max_debate_rounds: 1
+    max_risk_discuss_rounds: 1
+risk_ruleset: configs/risk_rules_v1.yaml
+analysis:
+  experiment_config: configs/cloud/experiment_google.yaml   # no analysis runs on the collector VM
+  decision_delay_seconds: 10
+  portfolio_snapshot: null        # null => portfolio UNKNOWN (never assumed flat)

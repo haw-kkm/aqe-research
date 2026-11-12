@@ -7,6 +7,8 @@ destination file — the same keys the collector's own upsert uses — and never
 `_transfer/<id>/merge_backup/<rel>`, the merged file is written beside it, re-read and verified (row count, every
 destination row unchanged), and swapped in atomically only if the destination did not change meanwhile.
 A destination modified within `settle_seconds` (the live collector is writing it) is deferred, not merged.
+With execute=True every merged or already-covered incoming version is recorded as `absorbed` in
+`_transfer/received_index.json`, so later transfer passes skip that exact version instead of quarantining it again.
 Raw `.jsonl.gz` captures never collide (timestamped names); anything else is left for manual review.
 """
 
@@ -23,6 +25,7 @@ from typing import Any
 
 import pandas as pd
 
+from aqe.ops.transfer import record_absorbed
 from aqe.storage import sha256_file
 
 TRANSFER_DIR = "_transfer"
@@ -129,6 +132,8 @@ def merge_conflicts(root: Path, transfer_id: str, *, execute: bool = False, sett
             continue
         if info["status"] == "covered":
             out["covered"].append(info)
+            if execute:  # nothing to add: this incoming version is fully contained in the destination
+                record_absorbed(root, rel, sha256_file(inc), transfer_id)
             continue
         if not execute:
             out["would_merge"].append(info)
@@ -144,6 +149,7 @@ def merge_conflicts(root: Path, transfer_id: str, *, execute: bool = False, sett
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dest, backup)
         os.replace(tmp, dest)
+        record_absorbed(root, rel, sha256_file(inc), transfer_id)
         with open(tx / "journal.jsonl", "a", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps({"rel": rel, "status": "merged", "rows_added": info["rows_added"], "sha256_before": sha_before,
                                  "sha256": sha256_file(dest), "backup": str(backup),

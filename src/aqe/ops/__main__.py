@@ -28,6 +28,8 @@ def _bars(args, exp_cfg: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
+    from aqe.ops.platform import ROLES
+
     ap = argparse.ArgumentParser(prog="python -m aqe.ops", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("platform", help="OS / arch / python / torch / CUDA facts of this host")
@@ -50,7 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--remote-python", default="python3")
     p.add_argument("--work-dir")
     p.add_argument("--mode", choices=("safe", "mirror"), default="safe",
-                   help="safe: never replace (Windows->Oracle). mirror: update files the destination last received from this source unchanged (Oracle->Google)")
+                   help="safe: never replace (Windows->cloud collector). mirror: update files the destination last received from "
+                        "this source store unchanged (collector -> Google training VM)")
+    p.add_argument("--ssh-option", action="append", default=[], metavar="KEY=VALUE",
+                   help="extra `ssh -o`/`scp -o` option, repeatable (e.g. StrictHostKeyChecking=accept-new, IdentityFile=/home/aqe/.ssh/id_ed25519)")
 
     p = sub.add_parser("transfer-manifest", help="(remote side) source manifest as JSON")
     p.add_argument("--root", required=True)
@@ -112,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-free-gb", type=float, default=20.0)
     p = sub.add_parser("preflight", help="role checks before enabling a service")
     p.add_argument("--config", required=True)
-    p.add_argument("--role", required=True)
+    p.add_argument("--role", required=True, help="one of: " + ", ".join(ROLES) + " (units pass ${AQE_ROLE} from /etc/aqe/aqe.env)")
     p.add_argument("--offline", action="store_true")
     p = sub.add_parser("cutover-compare", help="compare PC vs cloud collector data over an overlap window (GO/NO-GO)")
     p.add_argument("--ref-root", required=True, help="PC collector data_root (or a copy of it)")
@@ -126,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--report", required=True)
     p.add_argument("--approve")
     p.add_argument("--migration-receipt", required=True)
+    p.add_argument("--reference", choices=("windows", "linux"), default="windows",
+                   help="the collector being replaced: the Windows PC (Ctrl+C) or a Linux host such as Oracle (systemctl)")
     p = sub.add_parser("code-release-check", help="verify the checkout is exactly one clean commit (+ tests)")
     p.add_argument("--repo", default=".")
     p.add_argument("--run-tests", action="store_true")
@@ -159,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
 
         r = run_transfer(Endpoint.parse(a.source, a.remote_python), Endpoint.parse(a.dest, a.remote_python), a.kind,
                          execute=a.execute, transfer_id=a.transfer_id, settle_seconds=a.settle_seconds,
-                         work_dir=Path(a.work_dir) if a.work_dir else None, mode=a.mode)
+                         work_dir=Path(a.work_dir) if a.work_dir else None, mode=a.mode, ssh_options=a.ssh_option)
         _print(r)
         return 0 if (not a.execute or r.get("complete")) else 1
     if a.cmd == "transfer-manifest":
@@ -224,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "release-rollback":
             _print(rel.rollback_registry(Path(a.artifact_root), a.experiment, a.backup, a.approve))
         return 0
+    if a.cmd == "preflight" and a.role not in ROLES:
+        _print({"overall": "FAIL", "role": a.role, "checks": [{"check": "role", "status": "FAIL", "detail":
+                f"unknown role {a.role!r} (empty = AQE_ROLE missing from /etc/aqe/aqe.env); one of {', '.join(ROLES)}"}]})
+        return 1
     if a.cmd in ("health", "preflight"):
         from aqe.config import load_local_config
 
@@ -253,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "cutover-approve":
         from aqe.ops.cutover import approve
 
-        _print(approve(Path(a.report), a.approve, Path(a.migration_receipt)))
+        _print(approve(Path(a.report), a.approve, Path(a.migration_receipt), reference=a.reference))
         return 0
     if a.cmd == "code-release-check":
         from aqe.ops.coderelease import check_code_release

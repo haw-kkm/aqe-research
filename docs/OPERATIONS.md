@@ -69,3 +69,7 @@ the project contains no order client (T14).
   code-release-check}`. Transfers are dry-run unless `--execute`; activation/rollback need `--approve`.
 - Linux units: `deploy/linux/systemd/` (collector, 5-minute health timer, alert hook, shadow analysis — disabled by default).
 - Collector quality journal (new): `{data_root}/quality/<venue>/<market>/<symbol>/<UTC day>.jsonl` (append-only).
+- Roles (ADR-0016): `oracle-collector` / `google-collector` (24/7, same unit; `AQE_ROLE` in `/etc/aqe/aqe.env` selects
+  the preflight), `oracle-shadow`, `google-cpu-train` / `google-gpu-train`. Google-only operation = google-collector VM
+  + training VM that pulls with `deploy/google/sync_from_collector.sh aqe@<collector> [--execute]` (mirror mode, by
+  data-store id `status/data_store.json`) or `train_pipeline.sh --sync-from aqe@<collector>`. docs/CLOUD_DEPLOYMENT.md §15.

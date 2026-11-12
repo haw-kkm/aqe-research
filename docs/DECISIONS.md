@@ -190,3 +190,26 @@
   recent partitions) wait for the next incremental pass instead of being copied mid-write. A collector-only
   requirements file (`requirements/linux-arm64-collector.txt`, no ML libraries) is supported because the collect path
   imports none (test). Oracle may run a daily REST backfill timer so Google syncs one data source.
+
+## ADR-0016 — Google-only operation: `google-collector` role, store-identity mirror sync (2026-11-13, branch dev/cloud-deploy-update)
+- Context: the operator may run everything on Google Cloud: a 24/7 x86-64 collector VM plus the on-demand training VM,
+  with no Oracle host. ADR-0015 assumed Oracle as the only cloud collector (role, unit, requirements, preflight, docs).
+- Decision: (1) a fourth server role `google-collector` (Ubuntu 24.04 x86-64) next to `oracle-collector`, sharing one
+  collector unit; the unit reads the role from `/etc/aqe/aqe.env` (`AQE_ROLE`, written once by `bootstrap_host.sh`) and
+  `install_release.sh` / preflight refuse a role that differs from it. Collection settings are identical to the Oracle and
+  Windows configs (test-enforced); only the unused analysis reference differs. (2) Its default environment is the
+  collector-only `requirements/linux-x86_64-collector.txt` (same pins as the ARM64 collector file); requirement files
+  must match the host CPU. (3) Preflight treats every collector role alike (live Binance check, single collector, time
+  sync, no ML imports) and adds host facts that matter on small Google VMs: data_root on its own persistent disk (WARN
+  otherwise), RAM/swap (WARN below 1.5 GiB without swap), and names HTTP 451 from Binance as a region block (403: WAF
+  rule or location block) —
+  Binance refuses some regions (notably the US), which is where Google's free e2-micro lives. (4) Mirror sync identifies
+  its source by a data-store id (`status/data_store.json`, created once by the collector supervisor, host-local) instead
+  of the address: the same store at a new address keeps updating, a different store at the same address (rebuilt VM,
+  Oracle -> Google switch) turns grown partitions into conflicts for `transfer-merge`. Versions unioned by
+  `transfer-merge` are recorded (`absorbed`) and skipped later instead of being quarantined on every pass.
+  `train_pipeline.sh --sync-from` trains only after a complete, conflict-free pull. (5) Fixed an ADR-0015 defect: the
+  `aqe` account had a nologin shell, so every `ssh aqe@host <command>` transfer would have failed; it now has /bin/bash,
+  no password (key-only) and an empty authorized_keys; training VMs generate a pull key.
+- Not done / limits: nothing ran on a Google VM, a real SSH link, systemd or Binance from a Google region; shadow analysis
+  is not provided in the Google-only layout (the collector VM has no ML libraries); no cloud resource was created.

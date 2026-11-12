@@ -1,4 +1,4 @@
-# Healthcheck run by aqe-health@.timer: python -m aqe.ops health (exit 1 WARN, 2 CRITICAL) appends to
+# Healthcheck run by aqe-health@.timer on the collector host (Oracle or Google): python -m aqe.ops health (exit 1 WARN, 2 CRITICAL) appends to
 # {data_root}/ops/health.jsonl and the journal. A non-zero exit triggers aqe-alert@ (local hook, no external service).
 [Unit]
 Description=AQE collector healthcheck (%i)

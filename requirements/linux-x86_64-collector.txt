@@ -1,0 +1,30 @@
+# Google Cloud x86-64 COLLECTOR-ONLY environment (Ubuntu 24.04, Python 3.12) for the google-collector role:
+# `aqe collect` + local-collector supervisor + ops health/preflight + the source side of transfers (manifest/index).
+# No torch / LightGBM / scikit-learn / SciPy — the collect and transfer-source paths do not import them (tests check it).
+# Default for google-collector in deploy/linux/install_release.sh; training runs on the separate google-*-train VM.
+# Same pins as requirements/linux-arm64-collector.txt and common.txt (tests check it). Wheel availability:
+# scripts/check_wheels.py requirements/linux-x86_64-collector.txt --platform linux_x86_64 (metadata only).
+annotated-types==0.8.0
+anyio==4.16.0
+certifi==2026.10.23
+colorama==0.4.6
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+numpy==2.5.4
+packaging==26.3
+pandas==3.1.1
+pluggy==1.7.0
+pyarrow==26.0.1
+pydantic==2.14.3
+pydantic_core==2.50.4
+Pygments==2.21.0
+pytest==9.2.0
+python-dateutil==4.0.0
+PyYAML==6.0.3
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+tzdata==2026.6
+websockets==17.4

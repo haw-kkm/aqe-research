@@ -13,7 +13,14 @@ import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-ROLES = ("windows-dev", "oracle-collector", "oracle-shadow", "google-cpu-train", "google-gpu-train")
+ROLES = ("windows-dev", "oracle-collector", "oracle-shadow", "google-collector", "google-cpu-train", "google-gpu-train")
+# 24/7 public-data collectors (one per data store). Either can be the only collector: Oracle ARM64 (Oracle + Google
+# training) or Google x86-64 (Google-only operation). Both run local-collector/collect_local.py under the same unit.
+COLLECTOR_ROLES = ("oracle-collector", "google-collector")
+
+
+def is_collector_role(role: str) -> bool:
+    return role in COLLECTOR_ROLES
 
 
 def venv_python(venv_dir: Path, windows: bool | None = None) -> Path:
@@ -68,6 +75,7 @@ def detect() -> dict[str, Any]:
         info["torch"] = None
         info["torch_error"] = f"{type(exc).__name__}: {exc}"[:200]
         info["cuda_available"] = False
+    info.update(memory_gb())
     for mod in ("lightgbm", "numpy", "pandas", "pyarrow", "sklearn"):
         try:
             info[mod] = __import__(mod).__version__
@@ -77,17 +85,43 @@ def detect() -> dict[str, Any]:
     return info
 
 
+def memory_gb(meminfo: str | None = None) -> dict[str, float | None]:
+    """RAM and swap in GiB from /proc/meminfo (Linux); None elsewhere."""
+    if meminfo is None:
+        try:
+            meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+        except OSError:
+            return {"mem_total_gb": None, "swap_total_gb": None}
+    vals = {}
+    for line in meminfo.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("MemTotal", "SwapTotal") and rest.split():
+            vals[key] = round(int(rest.split()[0]) / 2**20, 2)  # kB -> GiB
+    return {"mem_total_gb": vals.get("MemTotal"), "swap_total_gb": vals.get("SwapTotal")}
+
+
 def role_requirements(role: str) -> dict[str, Any]:
-    """What a role needs from the host (checked by preflight; docs/CLOUD_DEPLOYMENT.md)."""
+    """What a role needs from the host (checked by preflight; docs/CLOUD_DEPLOYMENT.md).
+
+    collector roles: live Binance check, single-collector and time-sync checks, no ML imports required.
+    `separate_data_disk`: WARN when data_root shares the boot filesystem (Google: the data must survive a VM rebuild).
+    `recommended_mem_gb`: WARN below it unless swap makes up the difference (the collector peaks ~150-250 MB RSS;
+    pip installs and pandas/pyarrow imports need headroom)."""
     if role not in ROLES:
-        raise ValueError(f"unknown role {role}; one of {ROLES}")
-    req: dict[str, Any] = {"python": "3.12", "arch": None, "os": None, "gpu": False, "binance": False, "min_free_gb": 10.0}
+        raise ValueError(f"unknown role {role!r}; one of {ROLES}")
+    req: dict[str, Any] = {"python": "3.12", "arch": None, "os": None, "gpu": False, "binance": False, "min_free_gb": 10.0,
+                           "collector": is_collector_role(role), "separate_data_disk": False, "recommended_mem_gb": None}
     if role == "windows-dev":
         req.update(os="Windows")
     elif role.startswith("oracle"):
         req.update(os="Linux", arch="arm64", binance=role == "oracle-collector", min_free_gb=20.0)
+    elif role == "google-collector":
+        # Google-only operation: small x86-64 VM, data on its own persistent disk mounted at /srv/aqe
+        req.update(os="Linux", arch="x86_64", binance=True, min_free_gb=10.0, separate_data_disk=True)
     elif role == "google-cpu-train":
         req.update(os="Linux", arch="x86_64", min_free_gb=30.0)
     elif role == "google-gpu-train":
         req.update(os="Linux", arch="x86_64", gpu=True, min_free_gb=30.0)
+    if req["collector"]:
+        req["recommended_mem_gb"] = 1.5
     return req

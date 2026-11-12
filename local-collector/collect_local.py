@@ -82,7 +82,36 @@ def claim_data_root(root: Path, symbol: str, host: str | None = None) -> dict:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(owner, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+    ensure_store_id(root, host)
     return owner
+
+
+def ensure_store_id(root: Path, host: str) -> dict:
+    """Identity of this data store (`status/data_store.json`, host-local, written once, never changed). Downstream
+    mirror syncs (aqe.ops.transfer) use it to tell "the same store at a new address" from "a different store at the
+    same address" (rebuilt VM, Oracle -> Google collector switch)."""
+    import uuid
+
+    path = root / "status" / "data_store.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:  # never overwritten and never a reason to stop collecting; syncs fall back to the address
+            emit(f"WARNING: {path} is unreadable; left unchanged (mirror syncs compare the source address instead)")
+            return {}
+    ident = {"store_id": uuid.uuid4().hex, "created_at": datetime.now(timezone.utc).isoformat(), "created_by_host": host,
+             "data_root": str(root)}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(ident, indent=2), encoding="utf-8")
+    try:
+        os.link(tmp, path)  # create-if-absent: a concurrent first start cannot replace an existing id
+    except FileExistsError:
+        pass
+    except OSError:
+        if not path.exists():
+            os.replace(tmp, path)
+    tmp.unlink(missing_ok=True)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def emit(message: str) -> None:

@@ -1,8 +1,8 @@
 """Role preflight: run on the target host BEFORE enabling a service (docs/CLOUD_DEPLOYMENT.md).
 
 PASS/WARN/FAIL per check; any FAIL -> non-zero exit (systemd `ExecStartPre` refuses to start). Network checks
-(Binance REST ping + clock skew) are skipped only with `offline=True`, which the collector role does not accept.
-Nothing is written except a uniquely named probe file that is removed immediately.
+(Binance REST ping + clock skew) are skipped only with `offline=True`, which the collector roles (oracle-collector,
+google-collector) do not accept. Nothing is written except a uniquely named probe file that is removed immediately.
 """
 
 from __future__ import annotations
@@ -37,10 +37,38 @@ def timesync_status() -> tuple[str, str]:
         return "WARN", f"timedatectl unavailable ({type(exc).__name__}); check chrony manually"
 
 
-def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, host: dict[str, Any] | None = None) -> dict[str, Any]:
+def same_filesystem(a: Path, b: Path) -> bool | None:
+    """True if both paths are on one filesystem (st_dev); None where that is not meaningful (Windows) or unknown."""
+    if os.name == "nt":
+        return None
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return None
+
+
+def binance_failure_detail(exc: BaseException) -> str:
+    """Readable reason for a failed Binance REST check. HTTP 451 = Binance refuses this host's location (e.g. US cloud
+    regions): a region problem, not a transient network error. HTTP 403 = a firewall (WAF) rule or a location block."""
+    status = getattr(exc, "status", None)
+    if status == 451:
+        return ("Binance refused this host's location (HTTP 451): run the collector in a region Binance serves "
+                "(US regions are refused) and re-run preflight")
+    if status == 403:
+        return ("Binance refused the request (HTTP 403: firewall/WAF rule or location block): check the region and the "
+                "request rate, then re-run preflight")
+    return f"Binance REST unreachable: {type(exc).__name__}: {exc}"[:300]
+
+
+def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, host: dict[str, Any] | None = None,
+                  env_role: str | None = None, same_fs=same_filesystem) -> dict[str, Any]:
     req = role_requirements(role)
     host = host or detect()
     checks: list[dict[str, str]] = []
+    env_role = os.environ.get("AQE_ROLE") if env_role is None else env_role
+    if env_role:  # /etc/aqe/aqe.env names the host's role; the units pass it as --role
+        checks.append(_check("aqe_role", "PASS" if env_role == role else "FAIL",
+                             f"AQE_ROLE={env_role}" + ("" if env_role == role else f" but preflight runs for {role}: fix /etc/aqe/aqe.env")))
     py = ".".join(host["python"].split(".")[:2])
     checks.append(_check("python", "PASS" if py == req["python"] else "FAIL", f"{host['python']} (required {req['python']})"))
     if req["os"]:
@@ -60,8 +88,19 @@ def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, 
             checks.append(_check(label, "PASS" if free >= req["min_free_gb"] else "FAIL", f"{root} writable, {free:.1f} GiB free (min {req['min_free_gb']})"))
         except OSError as exc:
             checks.append(_check(label, "FAIL", f"{root}: {type(exc).__name__}: {exc}"))
+    if req["separate_data_disk"]:
+        shared = same_fs(Path(cfg.paths.data_root), Path(Path(cfg.paths.data_root).anchor or "/"))
+        if shared is not None:
+            checks.append(_check("data_disk", "WARN" if shared else "PASS",
+                                 "data_root is on the boot filesystem: attach a separate persistent disk at /srv/aqe so the data "
+                                 "survives a VM rebuild" if shared else "data_root is on its own filesystem"))
+    if req["recommended_mem_gb"] and host.get("mem_total_gb") is not None:
+        mem, swap = host["mem_total_gb"], host.get("swap_total_gb") or 0.0
+        ok = mem >= req["recommended_mem_gb"] or mem + swap >= req["recommended_mem_gb"] + 1.0
+        checks.append(_check("memory", "PASS" if ok else "WARN",
+                             f"RAM {mem} GiB, swap {swap} GiB (recommended RAM >= {req['recommended_mem_gb']} GiB or swap >= 1 GiB more)"))
     mods = ["numpy", "pandas", "pyarrow", "pydantic", "yaml", "httpx", "websockets"]
-    if role != "oracle-collector":
+    if not req["collector"]:  # collector roles may use the collector-only environment (no ML libraries)
         mods += ["lightgbm", "sklearn", "torch"]
     for m in mods:
         try:
@@ -71,7 +110,7 @@ def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, 
             checks.append(_check(f"import:{m}", "FAIL", f"{type(exc).__name__}: {exc}"[:200]))
     if req["gpu"]:
         checks.append(_check("cuda", "PASS" if host.get("cuda_available") else "FAIL", f"cuda_available={host.get('cuda_available')} {host.get('cuda_device') or ''}"))
-    if role == "oracle-collector":
+    if req["collector"]:
         status_p = Path(cfg.paths.data_root) / "status" / f"collector_{cfg.instruments[0].instrument_id}.json"
         final = False
         if status_p.exists():
@@ -88,7 +127,7 @@ def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, 
         checks.append(_check("timesync", ts, detail))
     if req["binance"] or role == "oracle-shadow":
         if offline:
-            checks.append(_check("binance", "FAIL" if req["binance"] else "WARN", "skipped (offline): the collector role requires the live check"))
+            checks.append(_check("binance", "FAIL" if req["binance"] else "WARN", "skipped (offline): collector roles require the live check"))
         else:
             if clock_factory is None:
                 from aqe.ingestion.binance_rest import BinanceRest
@@ -103,7 +142,8 @@ def run_preflight(cfg, role: str, *, offline: bool = False, clock_factory=None, 
                 checks.append(_check("binance_clock", "PASS" if ok else "FAIL",
                                      f"REST reachable; local-minus-Binance {skew:.1f} ms (limit {cfg.clock.max_abs_skew_ms:.0f})"))
             except Exception as exc:  # noqa: BLE001
-                checks.append(_check("binance_clock", "FAIL", f"Binance REST unreachable: {type(exc).__name__}: {exc}"[:300]))
+                checks.append(_check("binance_clock", "FAIL", binance_failure_detail(exc)))
     overall = "FAIL" if any(c["status"] == "FAIL" for c in checks) else ("WARN" if any(c["status"] == "WARN" for c in checks) else "PASS")
-    return {"role": role, "overall": overall, "host": {k: host.get(k) for k in ("os", "arch", "python", "torch", "cuda_available")},
+    return {"role": role, "overall": overall,
+            "host": {k: host.get(k) for k in ("os", "arch", "python", "torch", "cuda_available", "mem_total_gb", "swap_total_gb")},
             "checks": checks, "executable": sys.executable}

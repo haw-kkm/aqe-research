@@ -1,6 +1,7 @@
-# Daily REST backfill on Oracle (public Binance REST, weight-limited): completed 5m klines, settled funding, OI
+# Daily REST backfill on the collector host (Oracle or Google; public Binance REST, weight-limited): completed 5m klines, settled funding, OI
 # statistics into the same data store as the collector (upsert by key; the collector's 5m_live partition is separate).
-# Makes Oracle the single data source Google syncs for training. DISABLED by default:
+# Makes the collector store the single data source the Google training VM syncs. Runs in the collector-only
+# environment (no ML imports). DISABLED by default:
 #   sudo systemctl enable --now aqe-backfill.timer
 [Unit]
 Description=AQE REST backfill (klines, funding, OI)

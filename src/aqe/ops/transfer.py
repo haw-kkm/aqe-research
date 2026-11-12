@@ -1,7 +1,9 @@
 """Verified, resumable, never-overwriting transfer of data/artifact roots (docs/CLOUD_DEPLOYMENT.md §데이터 이전).
 
-Directions: Windows -> Oracle, Windows -> Google, Oracle -> Google (pull, when the Google VM is up), Google -> Oracle
-(model releases use aqe.ops.release instead). Exactly one side may be remote (`ssh://user@host/abs/root`).
+Directions: Windows -> cloud collector (Oracle or Google), collector -> Google training VM (pull, when the training VM
+is up: Oracle -> Google, or Google collector VM -> Google training VM), Oracle -> Google collector (moving the store).
+Model releases use aqe.ops.release. Exactly one side may be remote (`ssh://user@host/abs/root`, extra `ssh -o` options
+via `ssh_options`).
 
 Protocol (same for local and remote destinations):
   1. manifest  source files of class `transfer` (aqe.ops.inventory) with size + SHA-256; SQLite DBs as online-backup
@@ -17,6 +19,12 @@ DRY-RUN unless `execute=True`. The source is only read. Nothing is deleted: roll
 files into `_transfer/<id>/rolled_back/` after checking they are unchanged.
 Modes: `safe` (default) never replaces; `mirror` (downstream replica) updates a file only if the destination still holds
 the version it last received from the same source (`_transfer/received_index.json`), keeping the old version.
+"Same source" = the same collector data STORE (`status/data_store.json`, created once by the collector supervisor and
+never transferred), so a new address of the same store keeps updating while a different store behind the same address
+(rebuilt VM, switch from the Oracle to the Google collector) makes grown partitions conflicts for `transfer-merge`.
+Stores without an id (older collectors) fall back to comparing the source address.
+A source version that `transfer-merge` already unioned into the destination (`absorbed` in received_index.json) is
+skipped (SKIP_MERGED) instead of being quarantined again on every later pass.
 Conflicting collector partitions can be unioned by key with `aqe.ops.merge` (explicit, verified, backed up).
 """
 
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -39,7 +48,9 @@ from aqe.ops.inventory import scan, sqlite_backup
 from aqe.storage import sha256_file
 
 TRANSFER_DIR = "_transfer"
+STORE_FILE = "status/data_store.json"  # host-local identity of a collector data store (aqe.ops.inventory: never sent)
 Runner = Callable[[list[str], str | None], subprocess.CompletedProcess]
+_SSH_OPTION = re.compile(r"^[A-Za-z][A-Za-z0-9]*=\S+$")
 
 
 def default_runner(argv: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -51,6 +62,7 @@ class Endpoint:
     root: str  # absolute path on that side
     host: str | None = None  # user@host for ssh; None = local
     python: str = "python3"  # remote interpreter with aqe importable (e.g. /opt/aqe/current/.venv/bin/python)
+    ssh_options: tuple[str, ...] = ()  # KEY=VALUE pairs passed as `-o KEY=VALUE` to ssh and scp
 
     @property
     def remote(self) -> bool:
@@ -80,6 +92,7 @@ class Plan:
     entries: list[dict[str, Any]] = field(default_factory=list)  # rel, bytes, sha256, action, class
     excluded: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[dict[str, Any]] = field(default_factory=list)
+    source_store: dict[str, Any] | None = None  # data store identity of the source (None = unknown)
 
     def totals(self) -> dict[str, Any]:
         t: dict[str, Any] = {}
@@ -92,11 +105,12 @@ class Plan:
     def to_json(self) -> dict[str, Any]:
         return {"transfer_id": self.transfer_id, "kind": self.kind, "source": self.source, "dest": self.dest,
                 "created_at": self.created_at, "totals": self.totals(), "entries": self.entries, "excluded": self.excluded,
-                "snapshots": self.snapshots}
+                "snapshots": self.snapshots, "source_store": self.source_store}
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "Plan":
-        return cls(**{k: d[k] for k in ("transfer_id", "kind", "source", "dest", "created_at", "entries", "excluded", "snapshots")})
+        return cls(**{k: d[k] for k in ("transfer_id", "kind", "source", "dest", "created_at", "entries", "excluded", "snapshots")},
+                   source_store=d.get("source_store"))  # plans written before store ids existed have none
 
 
 def _utcnow() -> str:
@@ -117,6 +131,17 @@ def code_commit() -> str | None:
 
 
 # ---------------------------------------------------------------- manifest / index (run on the side that holds the files)
+def store_identity(root: Path) -> dict[str, Any] | None:
+    """The source store's id from `status/data_store.json` (read-only), or None when absent/unreadable."""
+    try:
+        d = json.loads((Path(root) / STORE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or not d.get("store_id"):
+        return None
+    return {k: d.get(k) for k in ("store_id", "created_at", "created_by_host")}
+
+
 def build_manifest(root: Path, kind: str, *, settle_seconds: int = 900, snapshot_dir: Path | None = None) -> dict[str, Any]:
     """Transferable files of `root` with SHA-256. SQLite DBs are snapshotted (online backup) into `snapshot_dir` and
     listed with rel `_snapshots/<rel>`; without snapshot_dir they are excluded. Read-only for `root`."""
@@ -141,7 +166,8 @@ def build_manifest(root: Path, kind: str, *, settle_seconds: int = 900, snapshot
             snaps.append({"of": f["rel"], "rel": rel, "integrity": info["integrity"], "tables": info["tables"]})
         else:
             excluded.append({"rel": f["rel"], "class": f["class"], "reason": f["reason"], "bytes": f["bytes"]})
-    return {"root": str(root), "kind": kind, "built_at": _utcnow(), "entries": entries, "excluded": excluded, "snapshots": snaps}
+    return {"root": str(root), "kind": kind, "built_at": _utcnow(), "entries": entries, "excluded": excluded, "snapshots": snaps,
+            "store": store_identity(Path(root))}
 
 
 def dest_index(root: Path, rels: list[str]) -> dict[str, str | None]:
@@ -157,22 +183,52 @@ MODES = ("safe", "mirror")
 
 
 def received_index(root: Path) -> dict[str, dict[str, Any]]:
-    """rel -> {sha256, source, transfer_id} of the last version this root RECEIVED (written by finalize)."""
+    """rel -> {sha256, source, transfer_id[, store_id]} of the last version this root RECEIVED (written by finalize),
+    plus `absorbed`: incoming versions already unioned into this file by transfer-merge (written by record_absorbed)."""
     p = Path(root) / TRANSFER_DIR / "received_index.json"
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
+def _write_received(root: Path, idx: dict[str, dict[str, Any]]) -> None:
+    tmp = Path(root) / TRANSFER_DIR / "received_index.json.tmp"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(idx, indent=0, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, Path(root) / TRANSFER_DIR / "received_index.json")
+
+
+def record_absorbed(root: Path, rel: str, incoming_sha256: str, transfer_id: str) -> None:
+    """transfer-merge unioned this incoming version into `rel`: later passes that offer the same version skip it."""
+    idx = received_index(root)
+    entry = idx.setdefault(rel, {})
+    absorbed = entry.setdefault("absorbed", [])
+    if incoming_sha256 not in absorbed:
+        absorbed.append(incoming_sha256)
+        entry["absorbed_by"] = transfer_id
+        _write_received(root, idx)
+
+
+def same_source(last: dict[str, Any], source: str, store_id: str | None) -> bool:
+    """Was `last` (a received_index entry) received from this source? By data store id when both sides know it,
+    otherwise by source address."""
+    if store_id and last.get("store_id"):
+        return last["store_id"] == store_id
+    return last.get("source") == source
+
+
 def make_plan(manifest: dict[str, Any], index: dict[str, str | None], *, transfer_id: str, source: str, dest: str,
               mode: str = "safe", received: dict[str, dict[str, Any]] | None = None) -> Plan:
-    """safe   (default; e.g. Windows -> Oracle): an existing file with other content is a CONFLICT, never replaced.
-    mirror (a downstream replica, e.g. Oracle -> Google): a file that grew at the source (monthly/hourly partitions)
-           is UPDATED only if the destination still holds exactly the version it last received from THIS source;
-           a locally changed or foreign file stays a CONFLICT. The replaced version is kept (`_transfer/<id>/replaced/`)."""
+    """safe   (default; e.g. Windows -> cloud collector): an existing file with other content is a CONFLICT, never replaced.
+    mirror (a downstream replica, e.g. collector -> Google training VM): a file that grew at the source (monthly/hourly
+           partitions) is UPDATED only if the destination still holds exactly the version it last received from THIS
+           source store (`same_source`); a locally changed or foreign file stays a CONFLICT. The replaced version is
+           kept (`_transfer/<id>/replaced/`)."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     received = received or {}
+    store = manifest.get("store")
+    store_id = (store or {}).get("store_id")
     plan = Plan(transfer_id=transfer_id, kind=manifest["kind"], source=source, dest=dest, created_at=_utcnow(),
-                excluded=manifest["excluded"], snapshots=manifest["snapshots"])
+                excluded=manifest["excluded"], snapshots=manifest["snapshots"], source_store=store)
     for e in manifest["entries"]:
         have = index.get(e["rel"])
         last = received.get(e["rel"]) or {}
@@ -182,7 +238,9 @@ def make_plan(manifest: dict[str, Any], index: dict[str, str | None], *, transfe
             action = "COPY"
         elif have == e["sha256"]:
             action = "SKIP_SAME"
-        elif mode == "mirror" and last.get("sha256") == have and last.get("source") == source:
+        elif e["sha256"] in (last.get("absorbed") or []):
+            action = "SKIP_MERGED"  # this exact source version was already unioned in by transfer-merge
+        elif mode == "mirror" and last.get("sha256") == have and same_source(last, source, store_id):
             action = "UPDATE"
         else:
             action = "CONFLICT"
@@ -241,17 +299,21 @@ def finalize(root: Path, plan: Plan) -> dict[str, Any]:
     root = Path(root)
     done = _journal(root, plan.transfer_id)
     received_updates: dict[str, str] = {}
-    stats: dict[str, Any] = {"placed": 0, "updated": 0, "skipped_same": 0, "conflicts": [], "failed": [], "already_done": 0,
-                             "bytes_placed": 0}
+    stats: dict[str, Any] = {"placed": 0, "updated": 0, "skipped_same": 0, "skipped_merged": 0, "conflicts": [], "failed": [],
+                             "already_done": 0, "bytes_placed": 0}
     for e in plan.entries:
         rel, sha = e["rel"], e["sha256"]
-        if rel in done and done[rel]["status"] in ("placed", "updated", "skip_same", "conflict_kept", "snapshot_kept"):
+        if rel in done and done[rel]["status"] in ("placed", "updated", "skip_same", "skip_merged", "conflict_kept", "snapshot_kept"):
             stats["already_done"] += 1
             continue
         if e["action"] == "SKIP_SAME":
             _append_journal(root, plan.transfer_id, {"rel": rel, "status": "skip_same", "sha256": sha})
             received_updates[rel] = sha
             stats["skipped_same"] += 1
+            continue
+        if e["action"] == "SKIP_MERGED":
+            _append_journal(root, plan.transfer_id, {"rel": rel, "status": "skip_merged", "sha256": sha})
+            stats["skipped_merged"] += 1
             continue
         inc = incoming_path(root, plan.transfer_id, rel)
         if not inc.is_file():
@@ -306,21 +368,22 @@ def finalize(root: Path, plan: Plan) -> dict[str, Any]:
         _append_journal(root, plan.transfer_id, {"rel": rel, "status": "conflict_kept", "sha256": sha, "path": str(keep)})
         stats["conflicts"].append({"rel": rel, "incoming_sha256": sha, "kept_at": str(keep)})
     receipt = {"transfer_id": plan.transfer_id, "kind": plan.kind, "source": plan.source, "dest": plan.dest,
-               "finalized_at": _utcnow(), "plan_totals": plan.totals(), **stats,
+               "source_store": plan.source_store, "finalized_at": _utcnow(), "plan_totals": plan.totals(), **stats,
                "complete": not stats["failed"], "code_commit": code_commit()}
     tx = _tx_dir(root, plan.transfer_id)
     tx.mkdir(parents=True, exist_ok=True)
     (tx / "receipt.json").write_text(json.dumps(receipt, indent=2, ensure_ascii=False), encoding="utf-8")
     if received_updates:  # which version of each file this root last received, and from where (mirror mode needs it)
         idx = received_index(root)
+        store_id = (plan.source_store or {}).get("store_id")
         for rel, sha in received_updates.items():
-            idx[rel] = {"sha256": sha, "source": plan.source, "transfer_id": plan.transfer_id}
-        tmp = Path(root) / TRANSFER_DIR / "received_index.json.tmp"
-        tmp.write_text(json.dumps(idx, indent=0, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, Path(root) / TRANSFER_DIR / "received_index.json")
+            keep = {"absorbed": idx[rel]["absorbed"]} if idx.get(rel, {}).get("absorbed") else {}
+            idx[rel] = {"sha256": sha, "source": plan.source, "transfer_id": plan.transfer_id,
+                        **({"store_id": store_id} if store_id else {}), **keep}
+        _write_received(root, idx)
     with open(Path(root) / TRANSFER_DIR / "transfers.jsonl", "a", encoding="utf-8", newline="\n") as fh:  # transfer volume log
         fh.write(json.dumps({k: receipt[k] for k in ("transfer_id", "kind", "source", "dest", "finalized_at", "placed", "updated",
-                                                       "bytes_placed", "skipped_same", "complete")}) + "\n")
+                                                       "bytes_placed", "skipped_same", "skipped_merged", "complete")}) + "\n")
     return receipt
 
 
@@ -353,26 +416,38 @@ def rollback(root: Path, transfer_id: str, execute: bool = False) -> dict[str, A
 
 
 # ---------------------------------------------------------------- orchestration
+def _opts(options) -> list[str]:
+    out: list[str] = []
+    for o in options:
+        if not _SSH_OPTION.match(o):
+            raise ValueError(f"ssh option must look like KEY=VALUE without spaces, got {o!r}")
+        out += ["-o", o]
+    return out
+
+
 def _ssh(ep: Endpoint, remote_argv: list[str], runner: Runner, stdin: str | None = None) -> subprocess.CompletedProcess:
     cmd = " ".join(shlex.quote(a) for a in remote_argv)
-    r = runner(["ssh", "-o", "BatchMode=yes", ep.host, cmd], stdin)
+    r = runner(["ssh", "-o", "BatchMode=yes", *_opts(ep.ssh_options), ep.host, cmd], stdin)
     if r.returncode != 0:
         raise RuntimeError(f"ssh {ep.host} failed ({r.returncode}): {(r.stderr or '')[-400:]}")
     return r
 
 
-def _scp(src: str, dst: str, runner: Runner) -> None:
-    r = runner(["scp", "-B", "-p", "-q", src, dst], None)
+def _scp(src: str, dst: str, runner: Runner, options: tuple[str, ...] = ()) -> None:
+    r = runner(["scp", "-B", "-p", "-q", *_opts(options), src, dst], None)
     if r.returncode != 0:
         raise RuntimeError(f"scp {src} -> {dst} failed ({r.returncode}): {(r.stderr or '')[-300:]}")
 
 
 def run_transfer(source: Endpoint, dest: Endpoint, kind: str, *, execute: bool = False, transfer_id: str | None = None,
                  settle_seconds: int = 900, runner: Runner = default_runner, max_attempts: int = 2,
-                 work_dir: Path | None = None, mode: str = "safe") -> dict[str, Any]:
+                 work_dir: Path | None = None, mode: str = "safe", ssh_options: list[str] | None = None) -> dict[str, Any]:
     """Plan (and with execute=True perform) one transfer. Returns the plan summary or the receipt."""
     if source.remote and dest.remote:
         raise ValueError("remote-to-remote is not supported: run the transfer on one of the two hosts")
+    if ssh_options:
+        _opts(ssh_options)  # validate before any connection
+        source.ssh_options = dest.ssh_options = tuple(ssh_options)
     tid = transfer_id or new_transfer_id()
     work = Path(work_dir or tempfile.mkdtemp(prefix=f"aqe-{tid}-"))
     work.mkdir(parents=True, exist_ok=True)
@@ -390,13 +465,13 @@ def run_transfer(source: Endpoint, dest: Endpoint, kind: str, *, execute: bool =
     if dest.remote:
         r = _ssh(dest, [dest.python, "-m", "aqe.ops", "transfer-index", "--root", dest.root], runner, stdin=json.dumps(rels))
         index = json.loads(r.stdout)
-        received = json.loads(_ssh(dest, [dest.python, "-m", "aqe.ops", "transfer-received", "--root", dest.root], runner).stdout) \
-            if mode == "mirror" else {}
+        received = json.loads(_ssh(dest, [dest.python, "-m", "aqe.ops", "transfer-received", "--root", dest.root], runner).stdout)
     else:
         index = dest_index(Path(dest.root), rels)
-        received = received_index(Path(dest.root)) if mode == "mirror" else {}
+        received = received_index(Path(dest.root))  # both modes: mirror updates + versions already merged in
     plan = make_plan(manifest, index, transfer_id=tid, source=source.describe(), dest=dest.describe(), mode=mode, received=received)
     summary = {"transfer_id": tid, "execute": execute, "mode": mode, "source": plan.source, "dest": plan.dest, "kind": kind,
+               "source_store": plan.source_store,
                "updates": [e["rel"] for e in plan.entries if e["action"] == "UPDATE"],
                "partition_problems": [e["partition_problem"] for e in plan.entries if e.get("partition_problem")],
                "totals": plan.totals(), "excluded": len(plan.excluded),
@@ -424,7 +499,7 @@ def run_transfer(source: Endpoint, dest: Endpoint, kind: str, *, execute: bool =
     # 4. finalize on the destination side
     if dest.remote:
         _ssh(dest, ["mkdir", "-p", f"{dest.root}/{TRANSFER_DIR}/{tid}"], runner)
-        _scp(str(plan_file), f"{dest.host}:{dest.root}/{TRANSFER_DIR}/{tid}/plan.json", runner)
+        _scp(str(plan_file), f"{dest.host}:{dest.root}/{TRANSFER_DIR}/{tid}/plan.json", runner, dest.ssh_options)
         r = _ssh(dest, [dest.python, "-m", "aqe.ops", "transfer-finalize", "--root", dest.root, "--transfer-id", tid], runner)
         receipt = json.loads(r.stdout)
     else:
@@ -445,7 +520,7 @@ def _copy_one(source: Endpoint, dest: Endpoint, tid: str, rel: str, src_path: st
         if json.loads(r.stdout).get(rel) == sha:
             return  # already uploaded and verified (resume)
         _ssh(dest, ["mkdir", "-p", str(PurePosixPath(remote_inc).parent)], runner)
-        _scp(src_path, f"{dest.host}:{remote_inc}.part", runner)
+        _scp(src_path, f"{dest.host}:{remote_inc}.part", runner, dest.ssh_options)
         _ssh(dest, ["mv", "-f", f"{remote_inc}.part", remote_inc], runner)  # own incoming dir only
         return  # verified by transfer-finalize on the destination
     inc = incoming_path(Path(dest.root), tid, rel)
@@ -454,7 +529,7 @@ def _copy_one(source: Endpoint, dest: Endpoint, tid: str, rel: str, src_path: st
     inc.parent.mkdir(parents=True, exist_ok=True)
     part = inc.with_name(inc.name + ".part")
     if source.remote:
-        _scp(f"{source.host}:{src_path}", str(part), runner)
+        _scp(f"{source.host}:{src_path}", str(part), runner, source.ssh_options)
     else:
         shutil.copy2(src_path, part)  # keeps mtime (like scp -p): placed files keep their original age
     got = sha256_file(part)
