@@ -1,6 +1,6 @@
 # 분석·토론 계층 — 구조안 v0.1 대비 구현 상태
 
-기준: `AQE_Agent_Debate_Structure_KO_v0_1.md`(2026-11-11). 개발 브랜치 `dev/debate-layer-update`(worktree `C:\vscode\aqe-dev`; 4304c5f = §4 반영, §5 재검토 반영은 미커밋).
+기준: `AQE_Agent_Debate_Structure_KO_v0_1.md`(2026-11-11). 개발 브랜치 `dev/debate-layer-update`(worktree `C:\vscode\aqe-dev`; 4304c5f = §4 반영, aadae59 = §5 반영, §6 계획 후보 선택은 미커밋).
 구분: **대체 LLM 시험**(scripted, 배선 검증) / **실제 LLM 호출**(미실행) / **실제 시장 자료 연결** / **분석 성능 검증**(미실행)은 서로 다른 증거다.
 
 ## 1. 기존 구현과의 관계 (중복 없음)
@@ -67,3 +67,13 @@
 | R01 | JSONL에 완전한 행 일부만 남으면 재시도가 "이미 반영"으로 DONE(배치 누락) | 가설 이력을 큐 DB로 이동: lease 확인·배치 전체·결과 outbox·DONE이 **한 SQLite 트랜잭션**. 예외 시 전부 rollback → 0행, job 재시도 시 배치 전체 기록. 배치마다 행 수·sha256, 행 수 불일치는 읽기 거부, UPDATE/DELETE는 트리거로 거부 | `test_r01_*`(배치 중 0/1/2/3행 뒤 장애 → 0행 → 재시도 4행), 무결성·append-only |
 | R02 | 큐 완료 뒤 파일 저장 실패 → DONE+결과 파일 없음, 재시도 불가 | 최종 assessment·DebateRecord를 같은 트랜잭션의 `context_outbox`에 저장, 파일은 그 뒤 outbox에서 기록(감사 파일 먼저, assessment 마지막). 실패·중단 시 다음 `process_one`이 LLM 재실행 없이 다시 기록. 모든 backend 결과에 적용 | `test_r02_*`(감사 기록 실패·assessment 실패·COMMIT 직후 중단 → 다음 실행이 복구, backend 1회), 일반 backend outbox |
 설계는 ADR-0013. PostgreSQL 목표 스키마에도 같은 표를 추가(`migrations/postgres/002_hypothesis_ledger_outbox.sql`, 서버 없어 미실행).
+
+## 6. 진입·손절·익절 후보 선택 연결 (2026-11-12, aadae59 위 미커밋) — 상세 `docs/TRADE_PLAN.md`, ADR-0014
+| 항목 | 내용 |
+|---|---|
+| 입력 | `planning.enabled`일 때만 근거 묶음에 코드 계산 후보 스냅샷(`plan_candidates`, 해시 포함). 비활성 시 묶음·프롬프트 불변 |
+| 역할 | CHART·FLOW·CRITIC은 후보를 공유 문맥으로만 받음(독립 증거 아님). SYNTHESIS는 기간별 `plan_selection`(후보 ID 또는 null) — 추가 호출 없음 |
+| 코드 검사 | 미지·다른 묶음·다른 기간·만료·선택 불가 ID, 가격 필드, 이유 텍스트의 지어낸 가격, 형식 보완이 추가한 선택 → 선택만 REJECTED(가설 유지) |
+| 저장 | `DebateRecord.plan_snapshot_id`·`plan_selections`, 커밋 트랜잭션 안에서 최종화(원장 미반영 → NOT_COMMITTED), outbox 복구 대상 |
+| 분석 | `offline_scripted` 선택은 분석에 쓰지 않음(`SCRIPTED_TEST`/`UNAVAILABLE` → WAIT). 위험 판정이 REVIEW_CANDIDATE가 아니면 항상 WAIT |
+| 근거 정정 | 호가 요약이 수집기 열 이름(`depth_bid_10bps_quote` 등)·`book_valid`·aggTrade 누락 구간을 따르도록 수정, STALE이면 항목 없음 |

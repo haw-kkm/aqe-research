@@ -44,3 +44,12 @@
 ## news JSONL 한 줄
 `{"evidence_id","source_id","source_url","title","excerpt","published_at","received_at","available_at","verification_status"}`
 - `verification_status`: VERIFIED / REPORTED / UNVERIFIED / RETRACTED. 소셜·루머는 UNVERIFIED로 둔다(사실로 승격하지 않음).
+
+## instrument spec (가격 tick) — `{data_root}/imports/instrument_specs/<venue>.<market_type>.<instrument_id>.json`
+진입·손절·익절 후보의 가격 반올림에 쓰는 거래소 tick(docs/TRADE_PLAN.md). 없으면 후보 가격을 반올림하지 않고 `tick_size=UNKNOWN` → 최종 판단 WAIT.
+```json
+{"instrument_id": "BTCUSDT",
+ "revisions": [{"tick_size": "0.10", "source_id": "binance.fapi.exchangeInfo PRICE_FILTER", "available_at": "2026-11-12T00:00:00Z"}]}
+```
+- `tick_size`는 문자열(정확한 Decimal). 바뀌면 새 revision을 추가한다(덮어쓰지 않음). as_of에는 `available_at <= as_of`인 최신 revision만 쓴다 —
+  나중에 받은 tick을 과거 as_of에 적용하지 않는다. `instrument_id`가 다르거나 읽을 수 없으면 사용하지 않는다(값을 추정하지 않음).

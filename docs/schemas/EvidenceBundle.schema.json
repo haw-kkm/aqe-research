@@ -1,5 +1,99 @@
 {
   "$defs": {
+    "CheckOutcome": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "UNKNOWN"
+      ],
+      "title": "CheckOutcome",
+      "type": "string"
+    },
+    "ConditionStatus": {
+      "enum": [
+        "MET",
+        "NOT_MET",
+        "NOT_EVALUATED"
+      ],
+      "title": "ConditionStatus",
+      "type": "string"
+    },
+    "CostAssumptions": {
+      "additionalProperties": false,
+      "properties": {
+        "taker_fee_bps": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Taker Fee Bps"
+        },
+        "slippage_bps": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Slippage Bps"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "funding_included": {
+          "default": false,
+          "title": "Funding Included",
+          "type": "boolean"
+        },
+        "note": {
+          "default": "funding not included: the holding time is not known in advance",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "taker_fee_bps",
+        "slippage_bps",
+        "source"
+      ],
+      "title": "CostAssumptions",
+      "type": "object"
+    },
+    "EntryCondition": {
+      "additionalProperties": false,
+      "properties": {
+        "condition_id": {
+          "title": "Condition Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ConditionStatus"
+        },
+        "observed": {
+          "default": "",
+          "title": "Observed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "condition_id",
+        "text",
+        "status"
+      ],
+      "title": "EntryCondition",
+      "type": "object"
+    },
     "EvidenceItem": {
       "additionalProperties": false,
       "properties": {
@@ -129,6 +223,91 @@
       "title": "EvidenceItem",
       "type": "object"
     },
+    "HorizonCandidates": {
+      "additionalProperties": false,
+      "properties": {
+        "horizon_seconds": {
+          "title": "Horizon Seconds",
+          "type": "integer"
+        },
+        "timeframe_seconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeframe Seconds"
+        },
+        "atr": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Atr"
+        },
+        "reference_price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reference Price"
+        },
+        "reference_time": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reference Time"
+        },
+        "candidates": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PlanCandidate"
+          },
+          "title": "Candidates",
+          "type": "array"
+        },
+        "no_candidate_reasons": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "No Candidate Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "horizon_seconds"
+      ],
+      "title": "HorizonCandidates",
+      "type": "object"
+    },
     "InstrumentKey": {
       "additionalProperties": false,
       "properties": {
@@ -151,6 +330,42 @@
       "title": "InstrumentKey",
       "type": "object"
     },
+    "InstrumentSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "instrument": {
+          "$ref": "#/$defs/InstrumentKey"
+        },
+        "tick_size": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Tick Size"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument",
+        "tick_size",
+        "source_id",
+        "available_at"
+      ],
+      "title": "InstrumentSpec",
+      "type": "object"
+    },
     "MarketType": {
       "enum": [
         "usdm_perpetual",
@@ -159,6 +374,359 @@
       ],
       "title": "MarketType",
       "type": "string"
+    },
+    "PlanCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "instrument": {
+          "$ref": "#/$defs/InstrumentKey"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "horizon_seconds": {
+          "title": "Horizon Seconds",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/PlanSide"
+        },
+        "timeframe_seconds": {
+          "title": "Timeframe Seconds",
+          "type": "integer"
+        },
+        "entry_low": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Entry Low"
+        },
+        "entry_high": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Entry High"
+        },
+        "conservative_entry": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Conservative Entry"
+        },
+        "entry_basis": {
+          "title": "Entry Basis",
+          "type": "string"
+        },
+        "entry_conditions": {
+          "items": {
+            "$ref": "#/$defs/EntryCondition"
+          },
+          "title": "Entry Conditions",
+          "type": "array"
+        },
+        "stop": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Stop"
+        },
+        "stop_basis": {
+          "title": "Stop Basis",
+          "type": "string"
+        },
+        "take_profits": {
+          "items": {
+            "$ref": "#/$defs/TakeProfit"
+          },
+          "title": "Take Profits",
+          "type": "array"
+        },
+        "net_loss_fraction": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Net Loss Fraction"
+        },
+        "levels": {
+          "items": {
+            "$ref": "#/$defs/PriceLevel"
+          },
+          "title": "Levels",
+          "type": "array"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/PlanCheck"
+          },
+          "title": "Checks",
+          "type": "array"
+        },
+        "invalidation": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Invalidation",
+          "type": "array"
+        },
+        "source_evidence_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Evidence Ids",
+          "type": "array"
+        },
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        },
+        "valid_until": {
+          "format": "date-time",
+          "title": "Valid Until",
+          "type": "string"
+        },
+        "label": {
+          "default": "rule-based technical candidate (unvalidated): not a learned price forecast, not a validated profit target",
+          "title": "Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "instrument",
+        "as_of",
+        "horizon_seconds",
+        "side",
+        "timeframe_seconds",
+        "entry_low",
+        "entry_high",
+        "conservative_entry",
+        "entry_basis",
+        "entry_conditions",
+        "stop",
+        "stop_basis",
+        "take_profits",
+        "levels",
+        "checks",
+        "invalidation",
+        "available_at",
+        "valid_until"
+      ],
+      "title": "PlanCandidate",
+      "type": "object"
+    },
+    "PlanCandidateSet": {
+      "additionalProperties": false,
+      "description": "One point-in-time candidate snapshot. Included in the EvidenceBundle (hashed), selected from by the debate,\nand referenced by the final plan — prices are never recomputed for an earlier selection.",
+      "properties": {
+        "snapshot_id": {
+          "title": "Snapshot Id",
+          "type": "string"
+        },
+        "algorithm_version": {
+          "title": "Algorithm Version",
+          "type": "string"
+        },
+        "config_hash": {
+          "title": "Config Hash",
+          "type": "string"
+        },
+        "input_hash": {
+          "title": "Input Hash",
+          "type": "string"
+        },
+        "instrument": {
+          "$ref": "#/$defs/InstrumentKey"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "input_description": {
+          "title": "Input Description",
+          "type": "string"
+        },
+        "last_bar_close": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Bar Close"
+        },
+        "last_bar_available_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Bar Available At"
+        },
+        "costs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostAssumptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "instrument_spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstrumentSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "spec_note": {
+          "default": "",
+          "title": "Spec Note",
+          "type": "string"
+        },
+        "horizons": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/HorizonCandidates"
+          },
+          "title": "Horizons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "algorithm_version",
+        "config_hash",
+        "input_hash",
+        "instrument",
+        "as_of",
+        "input_description"
+      ],
+      "title": "PlanCandidateSet",
+      "type": "object"
+    },
+    "PlanCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/CheckOutcome"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "outcome",
+        "detail"
+      ],
+      "title": "PlanCheck",
+      "type": "object"
+    },
+    "PlanSide": {
+      "enum": [
+        "LONG",
+        "SHORT"
+      ],
+      "title": "PlanSide",
+      "type": "string"
+    },
+    "PriceLevel": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Price"
+        },
+        "pivot_time": {
+          "format": "date-time",
+          "title": "Pivot Time",
+          "type": "string"
+        },
+        "confirmed_at": {
+          "format": "date-time",
+          "title": "Confirmed At",
+          "type": "string"
+        },
+        "timeframe_seconds": {
+          "title": "Timeframe Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "price",
+        "pivot_time",
+        "confirmed_at",
+        "timeframe_seconds"
+      ],
+      "title": "PriceLevel",
+      "type": "object"
     },
     "ScheduledEvent": {
       "additionalProperties": false,
@@ -312,10 +880,66 @@
         "EARNINGS_CALENDAR",
         "CROSS_ASSET",
         "ONCHAIN",
-        "CRYPTO_FUNDAMENTAL"
+        "CRYPTO_FUNDAMENTAL",
+        "AQE_NUMERIC"
       ],
       "title": "SourceKind",
       "type": "string"
+    },
+    "TakeProfit": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Price"
+        },
+        "basis": {
+          "title": "Basis",
+          "type": "string"
+        },
+        "net_reward_fraction": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Net Reward Fraction"
+        },
+        "net_rr": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Net Rr"
+        }
+      },
+      "required": [
+        "label",
+        "price",
+        "basis"
+      ],
+      "title": "TakeProfit",
+      "type": "object"
     },
     "Venue": {
       "enum": [
@@ -378,6 +1002,17 @@
     "bundle_hash": {
       "title": "Bundle Hash",
       "type": "string"
+    },
+    "plan_candidates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlanCandidateSet"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

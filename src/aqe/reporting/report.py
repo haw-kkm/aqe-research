@@ -9,6 +9,7 @@ from typing import Any
 from aqe.contracts.context import ContextAssessment
 from aqe.contracts.core import iso_utc
 from aqe.contracts.data import FeatureSnapshot
+from aqe.contracts.plan import TradePlan
 from aqe.contracts.predictions import EnsemblePrediction, ModelPrediction
 from aqe.contracts.risk import RiskDecision
 from aqe.storage import atomic_write_json, atomic_write_text
@@ -36,6 +37,8 @@ class AnalysisReport:
     config_hash: str = ""
     experiment_id: str = ""
     debate: dict[str, Any] | None = None  # debate summary (aqe_debate backend); display only
+    trade_plans: list[TradePlan] | None = None  # docs/TRADE_PLAN.md; None = feature disabled (report unchanged)
+    planning: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -61,6 +64,8 @@ class AnalysisReport:
             ],
             "unverified": self.unverified,
             "debate": self.debate,
+            **({"planning": self.planning, "trade_plans": [p.model_dump(mode="json") for p in self.trade_plans]}
+               if self.trade_plans is not None else {}),
         }
 
 
@@ -145,6 +150,8 @@ def render_markdown(r: AnalysisReport) -> str:
             L.append(f"| {rr.order} | {rr.rule_id} | {rr.outcome.value} | {rr.reason} | {rr.recovery_condition or ''} |")
         L.append(f"- approval_required={str(d.approval_required).lower()}, execution_enabled={str(d.execution_enabled).lower()}")
         L.append("")
+    if r.trade_plans is not None:
+        L.extend(render_trade_plans(r.trade_plans, r.planning or {}))
     L.append("## 5. 아직 검증하지 못한 부분")
     for u in r.unverified:
         L.append(f"- {u}")
@@ -193,7 +200,77 @@ def render_debate(d: dict[str, Any]) -> list[str]:
             L.append(f"- 이전 대비 변화: {hz['changed_since_previous']}")
     for pdc in d.get("prior_decisions") or []:
         L.append(f"- 이전 가설 `{pdc['hypothesis_id']}` → {pdc['decision']}: {pdc['reason']}")
+    for ps in d.get("plan_selections") or []:  # trade-plan selection verdicts (section 4b shows the plan)
+        L.append(f"- 계획 후보 선택 {_h(ps['horizon_seconds'])}: `{ps.get('candidate_id') or '관망(null)'}` · `{ps['status']}` — {ps.get('detail', '')}")
     for lim in d.get("limitations") or []:
         L.append(f"- 한계: {lim}")
     L.append("")
+    return L
+
+
+_SIDE_KO = {"LONG": "롱", "SHORT": "숏"}
+_DECISION_KO = {"LONG": "롱 검토", "SHORT": "숏 검토", "WAIT": "관망"}
+_COND_KO = {"MET": "충족", "NOT_MET": "미충족", "NOT_EVALUATED": "미평가"}
+
+
+def _v(x) -> str:
+    return "미확보" if x is None or x == "" else str(x)
+
+
+def _candidate_lines(c, chosen: bool) -> list[str]:
+    tag = "선택됨" if chosen else "미선택(기술적 후보)"
+    L = [f"- [{_SIDE_KO[c.side.value]} 후보 `{c.candidate_id}` · {tag} · 선택 가능 {'예' if c.selectable else '아니오(검사 실패)'}]",
+         f"  - 진입 구간: {c.entry_low} ~ {c.entry_high} (보수적 진입가 {c.conservative_entry}) · 산출: {c.entry_basis}",
+         "  - 진입 조건: " + "; ".join(f"{e.text} → {_COND_KO[e.status.value]} (관측: {_v(e.observed)})" for e in c.entry_conditions),
+         f"  - 손절: {c.stop} · 산출: {c.stop_basis}"]
+    for t in c.take_profits:
+        rr = "미확보(비용 정보 없음)" if t.net_rr is None else f"{t.net_rr}"
+        rw = "미확보" if t.net_reward_fraction is None else f"{t.net_reward_fraction * 100:+.3f}%"
+        L.append(f"  - 익절 {t.label}: {t.price} · 비용 후 보상 {rw} · 비용 후 RR {rr} · 산출: {t.basis}")
+    loss = "미확보" if c.net_loss_fraction is None else f"-{c.net_loss_fraction * 100:.3f}%"
+    L.append(f"  - 비용 후 손실폭(손절 시, 보수적 진입가 기준): {loss}")
+    L.append("  - 코드 검사: " + "; ".join(f"{k.name} `{k.outcome.value}`" + (f" ({k.detail})" if k.outcome.value != "PASS" else "")
+                                       for k in c.checks))
+    L.append(f"  - 무효화 조건: {'; '.join(c.invalidation)}")
+    L.append(f"  - 입력 시각: as_of `{iso_utc(c.as_of)}` · 입력 가용 `{iso_utc(c.available_at)}` · 만료 `{iso_utc(c.valid_until)}`")
+    return L
+
+
+def render_trade_plans(plans: list[TradePlan], meta: dict[str, Any]) -> list[str]:
+    """Entry/stop/take-profit review proposals. Rule-based candidates, LLM selection and the final decision are shown
+    as separate sources; the decision cannot be stronger than the risk disposition."""
+    costs = meta.get("costs")
+    cost_txt = (f"수수료 {costs['taker_fee_bps']}bps + 슬리피지 {costs['slippage_bps']}bps (편도, 진입·청산 양쪽), funding 미포함 — {costs['source']}"
+                if costs else "미확보")
+    L = ["## 4b. 진입·손절·익절 검토안 (규칙 계산 후보 · 수동 검토용 · 주문 아님)",
+         "> 가격 후보는 완료된 봉으로 코드가 계산한 **미검증 기술적 후보**다(학습된 가격 예측·검증된 수익 목표가 아니다). "
+         "ML 방향 확률(§2), 규칙 기반 가격 후보(이 절), LLM 해석(§3b)은 서로 다른 출처다. RR은 비용 후 보상/손실의 가격 비율이며 "
+         "성공 확률·기대수익이 아니다. 진입 조건 충족은 체결을 뜻하지 않는다. approval_required=true, execution_enabled=false.",
+         f"- 알고리즘 `{_v(meta.get('algorithm_version'))}` (설정 hash `{str(meta.get('config_hash') or '')[:12]}`) · 입력: {_v(meta.get('input'))}",
+         f"- 비용 가정: {cost_txt} · tick: {_v(meta.get('tick'))}",
+         f"- 선택 출처: `{_v(meta.get('selection_source'))}` — {_v(meta.get('selection_note'))}", ""]
+    for p in plans:
+        sides = {c.side.value for c in p.candidates}
+        tech = " / ".join(f"기술적 {_SIDE_KO[s]} 후보 {'있음' if s in sides else '없음'}" for s in ("LONG", "SHORT"))
+        prop = _SIDE_KO[p.proposal_side.value] if p.proposal_side else "없음"
+        L.append(f"### 기간 {_h(p.horizon_seconds)} — 결론: **{_DECISION_KO[p.decision.value]}** "
+                 f"(분석 후보 방향: {prop} / 최종 판단: {_DECISION_KO[p.decision.value]} / 위험 판정 `{p.risk_disposition.value}`)")
+        L.append(f"- {tech} · 계획 상태 `{p.status.value}` · 스냅샷 `{_v(p.snapshot_id)}` (as_of `{iso_utc(p.as_of) if p.as_of else '미확보'}`)")
+        L.append(f"- 선택: 출처 `{p.selection_source.value}` · 상태 `{p.selection_status.value}` · 선택 ID `{_v(p.selected_candidate_id)}`"
+                 + (f" · 사유(LLM 텍스트, 가격 출처 아님): {p.selection_reason}" if p.selection_reason else ""))
+        if p.evidence_ids or p.counter_evidence_ids:
+            L.append(f"- 근거: {', '.join(p.evidence_ids) or '없음'} · 반대 근거: {', '.join(p.counter_evidence_ids) or '없음'}")
+        if p.hypothesis_ids:
+            L.append(f"- 연결 가설: {', '.join(p.hypothesis_ids)}")
+        for c in p.candidates:
+            L.extend(_candidate_lines(c, chosen=c.candidate_id == p.selected_candidate_id))
+        for why in p.no_candidate_reasons:
+            L.append(f"- 후보 없음: {why}")
+        if p.invalidation_conditions:
+            L.append(f"- 무효화 조건(계획·가설): {'; '.join(p.invalidation_conditions)}")
+        L.append("- 관망·제한 사유:" if p.decision.value == "WAIT" else "- 남은 제한: 없음 (수동 검토용 제안이며 주문이 아니다)")
+        for i, w in enumerate(p.wait_reasons, 1):
+            L.append(f"  {i}. {w}")
+        L.append(f"- approval_required={str(p.approval_required).lower()}, execution_enabled={str(p.execution_enabled).lower()}")
+        L.append("")
     return L

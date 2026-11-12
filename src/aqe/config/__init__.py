@@ -115,6 +115,49 @@ class AnalysisConfig(_Cfg):
     portfolio_snapshot: Path | None = None
 
 
+class PlanningProfile(_Cfg):
+    """Per-horizon level computation: completed bars of `timeframe_seconds` (a multiple of the 5m base bar)."""
+
+    timeframe_seconds: int
+    lookback_bars: int
+    pivot_width: int = 3  # bars on EACH side that must be complete before a swing high/low counts (confirmation)
+    atr_period: int = 14  # simple mean of the true range over the last N completed bars
+
+
+class PlanningConfig(_Cfg):
+    """Trade-plan candidates (docs/TRADE_PLAN.md, algorithm swing_atr_v0). DISABLED by default — dev configs/tests only.
+    The numbers are explicit development defaults, not optimised and never tuned on the locked test segment."""
+
+    enabled: bool = False
+    profiles: dict[int, PlanningProfile] = Field(default_factory=lambda: {
+        3600: PlanningProfile(timeframe_seconds=300, lookback_bars=288),  # 1h horizon: 5m levels over 24h
+        86400: PlanningProfile(timeframe_seconds=3600, lookback_bars=168),  # 24h horizon: 1h levels over 7d
+    })
+    entry_buffer_atr: float = 0.25  # entry zone width beyond the level
+    stop_buffer_atr: float = 0.5  # stop distance beyond the level
+    max_entry_distance_atr: float = 3.0  # nearest level farther than this from the reference price -> no candidate
+    min_net_rr: float = 1.0  # TP1 net RR below this -> candidate not selectable (filter, not a quality claim)
+    max_input_age_seconds: int = 900  # last completed bar older than this at as_of -> STALE, no candidates
+    max_valid_seconds: int = 3600  # candidate validity = min(horizon, this)
+    instrument_specs_dir: str = "imports/instrument_specs"  # tick-size imports under data_root (IMPORT_FORMATS.md)
+
+    @field_validator("entry_buffer_atr", "stop_buffer_atr", "max_entry_distance_atr", "min_net_rr")
+    @classmethod
+    def _positive(cls, v: float) -> float:
+        if not (v > 0 and v < float("inf")):
+            raise ValueError("planning multipliers must be finite and positive")
+        return v
+
+    @field_validator("profiles")
+    @classmethod
+    def _profiles(cls, v: dict[int, PlanningProfile]) -> dict[int, PlanningProfile]:
+        for h, p in v.items():
+            if h <= 0 or p.timeframe_seconds <= 0 or p.timeframe_seconds % 300 or p.lookback_bars < 2 * p.pivot_width + 1 \
+                    or p.pivot_width < 1 or p.atr_period < 1:
+                raise ValueError(f"invalid planning profile for horizon {h}: {p}")
+        return v
+
+
 class LocalConfig(_Cfg):
     schema_version: str = "1.0.0"
     mode: RuntimeMode = RuntimeMode.RESEARCH
@@ -128,6 +171,7 @@ class LocalConfig(_Cfg):
     context: ContextConfig = ContextConfig()
     risk_ruleset: Path
     analysis: AnalysisConfig
+    planning: PlanningConfig = PlanningConfig()  # trade-plan candidates; off unless a dev config enables it
     fixture_bars: Path | None = None  # SYNTHETIC_FIXTURE input for M0 path
 
     @field_validator("instruments")
@@ -302,6 +346,7 @@ def resolve_secret(env_name: str | None) -> str | None:
 __all__ = [
     "ExperimentConfig",
     "LocalConfig",
+    "PlanningConfig",
     "config_hash",
     "load_experiment_config",
     "load_local_config",

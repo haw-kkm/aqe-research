@@ -12,6 +12,7 @@ from enum import StrEnum
 from pydantic import Field, model_validator
 
 from aqe.contracts.core import InstrumentKey, StrictModel, UTCDateTime, iso_utc
+from aqe.contracts.plan import PlanCandidateSet
 
 
 class SourceKind(StrEnum):
@@ -88,6 +89,7 @@ def compute_bundle_hash(
     items: tuple[EvidenceItem, ...],
     calendar: tuple[ScheduledEvent, ...],
     health: tuple[SourceHealth, ...],
+    plan_candidates: PlanCandidateSet | None = None,
 ) -> str:
     payload = {
         "instruments": [i.slug() for i in instruments],
@@ -99,6 +101,8 @@ def compute_bundle_hash(
                          + ((iso_utc(h.coverage_start) if h.coverage_start else "", iso_utc(h.coverage_end)) if h.coverage_end else ())
                          for h in health),
     }
+    if plan_candidates is not None:  # hashed only when present: bundles stored before trade plans keep their hash
+        payload["plan_candidates"] = plan_candidates.snapshot_id  # content hash of the whole snapshot (prices, config, inputs)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -110,6 +114,8 @@ class EvidenceBundle(StrictModel):
     calendar_snapshot: tuple[ScheduledEvent, ...] = ()
     source_health: tuple[SourceHealth, ...]
     bundle_hash: str
+    # rule-computed trade-plan candidates (docs/TRADE_PLAN.md): shared context for the debate, not an evidence item
+    plan_candidates: PlanCandidateSet | None = None
 
     @model_validator(mode="after")
     def _check(self) -> "EvidenceBundle":
@@ -126,8 +132,11 @@ class EvidenceBundle(StrictModel):
         ids = [it.evidence_id for it in self.items]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate evidence ids in bundle")
+        pc = self.plan_candidates
+        if pc is not None and (pc.as_of != self.as_of or pc.instrument not in self.instruments):
+            raise ValueError("plan candidate snapshot must have the bundle's as_of and instrument")
         expected = compute_bundle_hash(
-            self.instruments, self.as_of, self.items, self.calendar_snapshot, self.source_health
+            self.instruments, self.as_of, self.items, self.calendar_snapshot, self.source_health, pc
         )
         if expected != self.bundle_hash:
             raise ValueError("bundle_hash does not match bundle content")

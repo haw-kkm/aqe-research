@@ -104,22 +104,67 @@ def market_evidence(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime) -> t
                   "OI is aggregate; it does not identify who holds positions.")
             items.append(_item(f"mkt-oi-{tag}", SourceKind.MARKET_FLOW, "binance.futures.openInterestHist", "Open interest", ex,
                                o["available_at"].iloc[-1].to_pydatetime(), event_time=o["timestamp"].iloc[-1].to_pydatetime(), scope=[inst.instrument_id]))
-    fsdir = base / "flow_summaries" / inst.venue.value / inst.market_type.value / inst.instrument_id
-    if fsdir.exists():
-        files = sorted(fsdir.rglob("*.parquet"))
-        if files:
-            fs = pd.concat([pd.read_parquet(p) for p in files[-30:]], ignore_index=True)
-            if "available_at" in fs.columns:
-                fs = fs[pd.to_datetime(fs["available_at"], utc=True) <= pd.Timestamp(as_of)]
-                fs = fs[pd.to_datetime(fs["available_at"], utc=True) > pd.Timestamp(as_of) - pd.Timedelta(hours=1)]
-                if len(fs):
-                    cols = [c for c in fs.columns if c in ("book_valid", "spread_bps", "bid_depth_10bps_quote", "ask_depth_10bps_quote", "imbalance_top10", "cvd_delta_base", "buy_base", "sell_base")]
-                    summ = {c: (float(fs[c].astype(float).mean()) if c != "book_valid" else float(fs[c].astype(float).mean())) for c in cols}
-                    ex = f"Live collector flow (last hour, {len(fs)} rows): " + json.dumps({k: round(v, 4) for k, v in summ.items()}) + \
-                         ". Order-book walls/imbalance are observations; they do not reveal intent or account identity."
-                    items.append(_item(f"mkt-flow-{tag}", SourceKind.MARKET_FLOW, "aqe.collector.flow_summaries", "Order-book / trade-flow summary",
-                                       ex, pd.to_datetime(fs["available_at"], utc=True).max().to_pydatetime(), scope=[inst.instrument_id]))
-    return items, SourceHealth(source_kind=SourceKind.MARKET_FLOW, status=SourceHealthStatus.AVAILABLE, detail=f"{len(items)} items", last_available_at=wm)
+    flow, flow_note = flow_summary_item(cfg, inst, as_of, tag)
+    if flow is not None:
+        items.append(flow)
+    return items, SourceHealth(source_kind=SourceKind.MARKET_FLOW, status=SourceHealthStatus.AVAILABLE,
+                               detail=f"{len(items)} items; flow: {flow_note}", last_available_at=wm)
+
+
+FLOW_WINDOW = timedelta(hours=1)
+FLOW_MAX_AGE = timedelta(minutes=10)  # collector rows are 1-minute intervals; older than this = the feed stopped (STALE)
+# collector column names (ingestion/collector.py flow_tick); book metrics are valid only where book_valid is true
+FLOW_BOOK_COLS = ("spread_bps", "depth_bid_10bps_quote", "depth_ask_10bps_quote", "imbalance_top10")
+
+
+def flow_summary_item(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime, tag: str) -> tuple[EvidenceItem | None, str]:
+    """Collector order-book / trade-flow summary for the hour before as_of (point-in-time, stored rows only).
+
+    Book metrics use only rows with book_valid=true; trade sums only intervals without aggTrade gaps (book and trade
+    validity are separate). Stale (> FLOW_MAX_AGE) or missing data yields no item and the reason — never zeros.
+    Single-window statistics: no claim that resting orders appeared/disappeared, no participant identity or intent."""
+    fsdir = cfg.paths.data_root / "normalized" / "flow_summaries" / inst.venue.value / inst.market_type.value / inst.instrument_id
+    if not fsdir.exists():
+        return None, "no collector flow summaries"
+    lo, hi = pd.Timestamp(as_of) - FLOW_WINDOW, pd.Timestamp(as_of)
+    first, last = (lo - pd.Timedelta(hours=1)).floor("h"), hi.floor("h")
+    files = [p for p in sorted(fsdir.glob("*/*.parquet"))  # partition <day>/<hour>.parquet by interval_start
+             if p.parent.name.count("-") == 2 and p.stem.isdigit()
+             and first <= pd.Timestamp(f"{p.parent.name}T{p.stem}:00:00Z") <= last]
+    if not files:
+        return None, f"no flow summary partition for {iso_utc(lo.to_pydatetime())}..{iso_utc(as_of)}"
+    fs = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+    av = pd.to_datetime(fs["available_at"], utc=True)
+    fs = fs[(av <= hi) & (av > lo)].sort_values("interval_start")
+    if fs.empty:
+        return None, "no flow summary rows available in the hour before as_of"
+    last_av = pd.to_datetime(fs["available_at"], utc=True).max()
+    if hi - last_av > FLOW_MAX_AGE:
+        return None, f"STALE: last flow summary available {iso_utc(last_av.to_pydatetime())} (> {FLOW_MAX_AGE} before as_of)"
+    book = fs[fs["book_valid"].astype(bool)] if "book_valid" in fs.columns else fs.iloc[0:0]
+    trades = fs[fs["agg_missing"].fillna(1).astype(int) == 0] if "agg_missing" in fs.columns else fs
+    w0, w1 = pd.Timestamp(fs["interval_start"].iloc[0]), pd.Timestamp(fs["interval_end"].iloc[-1])
+    parts = [f"Collector flow summaries, 1-minute intervals {iso_utc(w0.to_pydatetime())}..{iso_utc(w1.to_pydatetime())} "
+             f"({len(fs)} rows; order book valid in {len(book)}; trade intervals without aggTrade gaps {len(trades)})."]
+    if len(book):
+        stats = []
+        for c in FLOW_BOOK_COLS:
+            if c in book.columns and book[c].notna().any():
+                v = book[c].astype(float).dropna()
+                stats.append(f"{c} mean {v.mean():.4g} / last {v.iloc[-1]:.4g}")
+        parts.append("Order book (valid rows only): " + "; ".join(stats) + ".")
+    else:
+        parts.append("Order book: no valid rows in the window (book not synchronised) — no order-book evidence.")
+    if len(trades) and {"buy_base", "sell_base", "cvd_delta_base"} <= set(trades.columns):
+        parts.append(f"Taker trades (gap-free intervals only): buy {trades['buy_base'].sum():.3f} / sell {trades['sell_base'].sum():.3f} base, "
+                     f"CVD change {trades['cvd_delta_base'].sum():+.3f} base over the window.")
+    else:
+        parts.append("Taker trades: no gap-free interval in the window — no trade-flow evidence.")
+    parts.append("These are point-in-time observations of one window: they do not show how resting orders changed, and the book "
+                 "does not reveal who placed orders or why.")
+    item = _item(f"mkt-flow-{tag}", SourceKind.MARKET_FLOW, "aqe.collector.flow_summaries", "Order-book / trade-flow summary",
+                 " ".join(parts), last_av.to_pydatetime(), event_time=w1.to_pydatetime(), scope=[inst.instrument_id], max_len=2000)
+    return item, f"{len(fs)} rows to {iso_utc(last_av.to_pydatetime())}"
 
 
 CALENDAR_LOOKBACK = timedelta(days=1)
@@ -316,9 +361,16 @@ def build_bundle(cfg: LocalConfig, inst: InstrumentKey, as_of: datetime, include
         num_items, num_health = numeric_evidence(cfg, inst, as_of)
         health.append(num_health)
     items = tuple(m_items + n_items + num_items)
-    h = compute_bundle_hash((inst,), as_of, items, tuple(cal), tuple(health))
+    plan = None
+    if cfg.planning.enabled:  # computed BEFORE the debate; the same snapshot is selected from and reported (docs/TRADE_PLAN.md)
+        from aqe.planning.candidates import candidates_for_config
+
+        src = tuple(i.evidence_id for i in m_items if i.evidence_id.startswith(("mkt-bars-", "mkt-daily-")))
+        plan = candidates_for_config(cfg, inst, as_of, source_evidence_ids=src)
+    h = compute_bundle_hash((inst,), as_of, items, tuple(cal), tuple(health), plan)
     return EvidenceBundle(bundle_id=f"bundle-{inst.instrument_id}-{to_ms(as_of)}-{h[:10]}", instruments=(inst,), as_of=as_of,
-                          items=items, calendar_snapshot=tuple(cal), source_health=tuple(health), bundle_hash=h)
+                          items=items, calendar_snapshot=tuple(cal), source_health=tuple(health), bundle_hash=h,
+                          plan_candidates=plan)
 
 
 _ = (utc_now, Path)

@@ -107,6 +107,15 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
             portfolio=portfolio, last_price=last_price,
         ), rs, rs_hash)
         horizons.append(HorizonResult(h, preds, ens, risk))
+    trade_plans = planning_meta = None
+    if cfg.planning.enabled:  # docs/TRADE_PLAN.md: rule-based candidates + committed selection + risk -> review proposal
+        from aqe.planning.candidates import LIVE_LABEL
+        from aqe.planning.plan import plans_for_analysis
+
+        label = ("SYNTHETIC_FIXTURE 5m bars (function test only, no market meaning)" if cfg.fixture_bars is not None
+                 else LIVE_LABEL)
+        trade_plans, planning_meta = plans_for_analysis(cfg, inst, as_of, decision_time, bars,
+                                                        [(h.horizon_seconds, h.risk) for h in horizons], context, label)
     if context is None:
         unverified.append("컨텍스트(뉴스·일정·교차자산) 근거가 없다: context worker 미실행 또는 유효한 평가 없음.")
     unverified.append("flow_v1(L2·aggTrade CVD·OI·funding 흐름) 모델은 아직 학습되지 않았다.")
@@ -123,11 +132,15 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
         analysis_id=analysis_id, mode=mode.value, generated_at=utc_now(), decision_time=decision_time,
         snapshot=snapshot, horizons=horizons, context=context, data_quality=dq, unverified=unverified,
         config_hash=cfg_hash, experiment_id=exp.experiment_id, debate=debate_summary,
+        trade_plans=trade_plans, planning=planning_meta,
     )
     out_dir = cfg.paths.data_root / "reports"
     jp, mp = write_report(report, out_dir)
     rec.outputs.update({"report_json": str(jp), "report_md": str(mp), "analysis_id": analysis_id,
                         "dispositions": {str(h.horizon_seconds): h.risk.disposition.value for h in horizons}})
+    if trade_plans is not None:
+        rec.outputs["trade_plans"] = {str(p.horizon_seconds): {"decision": p.decision.value, "status": p.status.value,
+                                                               "candidates": [c.side.value for c in p.candidates]} for p in trade_plans}
     all_abstain = all(h.ensemble.status.value == "ABSTAIN" for h in horizons)
     return EXIT_NOT_READY if all_abstain else EXIT_OK
 
@@ -135,6 +148,7 @@ def run_analyze(cfg: LocalConfig, cfg_hash: str, rec: RunRecord, as_of_override:
 def run_report(cfg: LocalConfig, rec: RunRecord, analysis_id: str | None) -> int:
     """Re-render a stored analysis JSON (does not recompute or alter judgements)."""
     from aqe.contracts.context import ContextAssessment
+    from aqe.contracts.plan import TradePlan
     from aqe.contracts.predictions import EnsemblePrediction, ModelPrediction
     from aqe.contracts.risk import RiskDecision
     from aqe.reporting.report import render_markdown
@@ -159,6 +173,8 @@ def run_report(cfg: LocalConfig, rec: RunRecord, analysis_id: str | None) -> int
         context=ContextAssessment.model_validate(d["context"]) if d.get("context") else None,
         data_quality=d["data_quality"], unverified=d.get("unverified", []), config_hash=d.get("config_hash", ""),
         experiment_id=d.get("experiment_id", ""), debate=d.get("debate"),
+        trade_plans=[TradePlan.model_validate(p) for p in d["trade_plans"]] if d.get("trade_plans") is not None else None,
+        planning=d.get("planning"),
     )
     mp = Path(str(jp)[:-5] + ".md")
     atomic_write_text(mp, render_markdown(rep))

@@ -9,7 +9,8 @@
         "EARNINGS_CALENDAR",
         "CROSS_ASSET",
         "ONCHAIN",
-        "CRYPTO_FUNDAMENTAL"
+        "CRYPTO_FUNDAMENTAL",
+        "AQE_NUMERIC"
       ],
       "title": "SourceKind",
       "type": "string"

@@ -13,6 +13,7 @@ from enum import StrEnum
 from pydantic import Field, model_validator
 
 from aqe.contracts.core import InstrumentKey, StrictModel, UTCDateTime
+from aqe.contracts.plan import PlanSelection, PlanSelectionRecord
 
 
 class AnalystRole(StrEnum):
@@ -129,6 +130,9 @@ class HorizonSynthesis(StrictModel):
     unresolved: tuple[str, ...] = ()
     changed_since_previous: str = ""
     abstain_reason: str | None = None
+    # trade-plan selection (docs/TRADE_PLAN.md): a candidate id of the bundle's snapshot or null = wait. Absent in
+    # answers given without plan candidates (older records) -> no selection. Validated separately by planning.selection.
+    plan_selection: PlanSelection | None = None
 
     @model_validator(mode="after")
     def _check(self) -> "HorizonSynthesis":
@@ -203,3 +207,5 @@ class DebateRecord(StrictModel):
     ledger_note: str = ""
     ledger_base_version: str | None = None  # ledger version the debate's priors were read from (commit checks it)
     hypothesis_id_map: dict[str, str] = Field(default_factory=dict)  # LLM id -> canonical ledger id (only when applied)
+    plan_snapshot_id: str | None = None  # the bundle's trade-plan candidate snapshot the selections refer to
+    plan_selections: tuple[PlanSelectionRecord, ...] = ()  # code verdict per horizon, finalized in the commit transaction

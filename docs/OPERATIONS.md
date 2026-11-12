@@ -54,3 +54,11 @@ are plain `aqe` commands; `deploy/windows/supervise.ps1` restarts them with expo
 ## Secrets
 Only environment variables (`.env.example`). Never commit `.env`. No exchange API keys are used or needed —
 the project contains no order client (T14).
+
+## Trade-plan candidates (docs/TRADE_PLAN.md, ADR-0014)
+- Off by default (`planning.enabled: false`). Dev-only config: `configs/dev_trade_plan_offline.yaml` (copied snapshot
+  `E:\aqe-v2-dev`, separate queue/ledger DB `meta/aqe_meta_trade_plan.sqlite`, scripted LLM).
+- `aqe analyze` adds `trade_plans` (JSON) and section `4b` (Markdown). Every plan is advisory: approval_required=true,
+  execution_enabled=false; the decision is WAIT unless the risk disposition is REVIEW_CANDIDATE and a committed
+  real-LLM selection passes every check. Tick sizes come only from `{data_root}/imports/instrument_specs/` (none yet →
+  `tick_size=UNKNOWN`).

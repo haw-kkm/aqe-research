@@ -127,3 +127,31 @@
   (`migrations/postgres/002_hypothesis_ledger_outbox.sql`, not executed — no server).
 - Residual: a crash between materialization and `materialized_at` re-writes identical files (atomic, idempotent).
   The pre-commit DebateRecord written in `finish` stays "pending commit" if the job is never committed — that is true.
+
+## ADR-0014 — Trade-plan candidates: code computes prices, the LLM only selects, risk gates the decision (2026-11-12)
+- Context: reports should show a reviewable plan per horizon (long/short/wait, entry zone, stop, take-profit, reasons,
+  invalidation) without letting an LLM invent prices and without loosening RESEARCH_ONLY/ABSTAIN. Simulation, orders,
+  sizing and new models are out of scope.
+- Decision: (1) `planning/candidates.py` (`swing_atr_v0`, pure) computes at most one LONG and one SHORT candidate per
+  horizon from completed bars only — confirmed swing levels (`confirmed_at` = availability of the last right-side bar),
+  ATR buffers, intact opposite levels as targets, tick rounding away from the favourable side when a tick import is
+  available at as_of, net reward/loss/RR from the conservative zone end via the existing `trade_return` (fees + adverse
+  slippage both legs, funding excluded). Missing inputs give no candidate or UNKNOWN checks — never filled-in values.
+  (2) The snapshot is computed before the debate and stored in `EvidenceBundle.plan_candidates` (hashed only when
+  present, so old bundle hashes are unchanged; content/config changes change the bundle hash and the cache key).
+  (3) The synthesis may return `plan_selection` = one listed id or null inside its existing call (no extra LLM call);
+  `planning/selection.py` rejects unknown/foreign/other-horizon/expired/unselectable ids, extra fields (prices),
+  invented price-like numbers in the reason and selections that appear only after the format repair. A rejected
+  selection is never replaced by another candidate. (4) Verdicts are stored in `DebateRecord.plan_selections` and
+  finalized inside the ADR-0013 commit transaction: not applied (late, stale ledger, lease lost, invalid) →
+  NOT_COMMITTED. (5) `planning/plan.py` builds `TradePlan` at analysis time from the committed selection, the SAME
+  snapshot (by id) and the independent risk decision; the `TradePlan` contract allows LONG/SHORT only with
+  REVIEW_CANDIDATE, an ACCEPTED real-LLM selection, all checks PASS and all entry conditions MET; otherwise WAIT with
+  reasons. approval_required=true, execution_enabled=false always; no account fields exist.
+- Also fixed: the order-book summary read `bid_depth_10bps_quote` while the collector writes `depth_bid_10bps_quote`;
+  it now uses the collector names, book metrics only from `book_valid` rows, trade sums only from gap-free intervals,
+  the as_of hour partitions (not "the last 30 files") and reports STALE instead of old values.
+- Off by default (`planning.enabled: false`); with it off, bundles, prompts (byte-identical) and reports are unchanged.
+  Defaults are explicit development values, not tuned on the locked segment. offline_scripted selections stay
+  excluded from analysis and are labelled SCRIPTED_TEST. Not done: G01 live-bar merge, tick import source, real LLM,
+  scoring of plan outcomes, simulation.

@@ -31,6 +31,7 @@ bridge = importlib.util.module_from_spec(_bridge_spec)
 _bridge_spec.loader.exec_module(bridge)
 
 EV_TAG = re.compile(r"\[ev:([A-Za-z0-9._:\-]+)\]")
+PLAN_TAG = re.compile(r"\[plan:(pc-[0-9a-f]+)\] horizon (\d+)s (LONG|SHORT) selectable=(yes|no)")
 
 
 def _merge(a: dict, b: dict) -> dict:
@@ -109,14 +110,43 @@ def scripted_model(options: dict):
                     "unresolved": ["order-book evidence missing"], "changed_since_previous": "first run" if not prior_ids else "re-confirmed"})
             decisions = [{"hypothesis_id": prior_ids[0], "decision": options.get("prior_decision", "KEEP"), "reason": "still consistent",
                           "evidence_ids": ids[:1]}] if prior_ids else []
+            plain = json.dumps({"horizons": hz, "prior_decisions": decisions, "limitations": ["news and cross-market roles not activated"]})
+            if "PLAN_CANDIDATES" in user:  # trade-plan selection (contract test only; never presented as an AI choice)
+                plan_selection(hz, user, ids, options.get("plan_select", "first"))
             good = json.dumps({"horizons": hz, "prior_decisions": decisions, "limitations": ["news and cross-market roles not activated"]})
             state["last_synthesis"] = good
+            if options.get("format_fix_adds_selection") and state["synth_calls"] == 1:
+                return "Here is the synthesis: " + plain[:-1] + ",}"  # broken JSON WITHOUT a selection; the repair adds one
             if options.get("bad_synthesis_first") and state["synth_calls"] == 1:
                 return "Here is the synthesis: " + good[:-1] + ",}"  # same content, broken JSON
             return good
         if stage == "FORMAT_FIX":
             return state["last_synthesis"] or "{}"  # reformat only: no new content
         return "{}"
+
+    def plan_selection(hz: list, user: str, ids: list, mode: str) -> None:
+        cands = [(cid, int(h), side, sel == "yes") for cid, h, side, sel in PLAN_TAG.findall(user)]
+        for block in hz:
+            h = block["horizon_seconds"]
+            mine = [c for c in cands if c[1] == h]
+            other = [c for c in cands if c[1] != h]
+            pick = next((c[0] for c in mine if c[3]), None)
+            reason = "scripted selection (wiring test, not an AI judgement)"
+            extra = {}
+            if mode == "none":
+                pick = None
+            elif mode == "ghost":
+                pick = "pc-000000000000deadbeef"
+            elif mode == "other_horizon":
+                pick = other[0][0] if other else "pc-none"
+            elif mode == "unselectable":
+                pick = next((c[0] for c in mine if not c[3]), "pc-none")
+            elif mode == "price_field":
+                extra = {"entry_price": 12345.6}
+            elif mode == "price_text":
+                m = re.search(r"reference close (\d+(?:\.\d+)?)", user)
+                reason += f"; enter at {float(m.group(1)) * 1.013:.1f}" if m else "; enter at 1"
+            block["plan_selection"] = {"candidate_id": pick, "reason": reason, "evidence_ids": ids[:1], "counter_evidence_ids": [], **extra}
 
     class Scripted(BaseChatModel):
         @property
@@ -224,7 +254,9 @@ def build_graph(job: dict, llm, log: list):
             fix_user = job["format_fix"]["user"].replace("{{BAD_OUTPUT}}", text[:6000])
             text2, ev2 = call("FORMAT_FIX", job["format_fix"]["system"], fix_user)
             obj2, err2 = parsed(text2)
-            out = {"synthesis": {"raw": text2, "parsed": obj2, "error": err2 or ev2.get("error"), "format_fixed": obj2 is not None},
+            # raw_before_fix lets core verify that the repair added nothing (e.g. no new plan selection)
+            out = {"synthesis": {"raw": text2, "parsed": obj2, "error": err2 or ev2.get("error"), "format_fixed": obj2 is not None,
+                                 "raw_before_fix": text},
                    "calls": (1 if ev["attempted"] else 0) + (1 if ev2["attempted"] else 0), "events": [ev, ev2]}
         return out
 
